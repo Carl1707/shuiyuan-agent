@@ -1,0 +1,33 @@
+.env
+.env.local
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Local development artifacts
+data/
+reports/
+evaluation_runs/
+benchmark/
+
+# Large local course artifacts
+*.pdf
+*.pptx
+
+# Local editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
