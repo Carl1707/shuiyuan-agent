@@ -396,11 +396,11 @@ def _resolve_defaults(default_answer_backend: str) -> WebAppDefaults:
     if backend not in {"extractive", "llm"}:
         raise ValueError(f"invalid default answer backend: {backend}")
     return WebAppDefaults(
-        api_base=os.environ.get("DPSK_API_BASE", "https://models.sjtu.edu.cn/api/v1").strip(),
-        model=os.environ.get("DPSK_MODEL", "deepseek-chat").strip(),
+        api_base=os.environ.get("SJTU_LLM_API_BASE", "https://models.sjtu.edu.cn/api/v1").strip(),
+        model=os.environ.get("SJTU_LLM_MODEL", "deepseek-chat").strip(),
         answer_backend=backend,
         community_base_url=os.environ.get("SHUIYUAN_BASE_URL", "https://shuiyuan.sjtu.edu.cn").strip(),
-        llm_configured=bool(os.environ.get("DPSK_API_KEY", "").strip()),
+        llm_configured=bool(os.environ.get("SJTU_LLM_API_KEY", "").strip()),
     )
 
 

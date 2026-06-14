@@ -19,7 +19,7 @@ class LLMError(RuntimeError):
 
 
 @dataclass(slots=True)
-class DeepSeekConfig:
+class LLMConfig:
     api_key: str
     api_base: str = "https://models.sjtu.edu.cn/api/v1"
     model: str = "deepseek-chat"
@@ -66,26 +66,28 @@ def load_local_env() -> None:
                 os.environ[key] = value
 
 
-def load_deepseek_config(
+def load_llm_config(
     model: str | None = None,
     *,
     api_key: str | None = None,
     api_base: str | None = None,
     timeout_seconds: int | None = None,
-) -> DeepSeekConfig:
+) -> LLMConfig:
     load_local_env()
-    api_key = (api_key if api_key is not None else os.environ.get("DPSK_API_KEY", "")).strip()
+    api_key = (api_key if api_key is not None else os.environ.get("SJTU_LLM_API_KEY", "")).strip()
     if not api_key:
-        raise LLMError("missing DPSK_API_KEY")
+        raise LLMError("missing SJTU_LLM_API_KEY")
     api_base = (
-        api_base if api_base is not None else os.environ.get("DPSK_API_BASE", "https://models.sjtu.edu.cn/api/v1")
+        api_base
+        if api_base is not None
+        else os.environ.get("SJTU_LLM_API_BASE", "https://models.sjtu.edu.cn/api/v1")
     ).strip().rstrip("/")
     _validate_llm_api_base(api_base)
-    resolved_model = (model or os.environ.get("DPSK_MODEL") or "deepseek-chat").strip()
+    resolved_model = (model or os.environ.get("SJTU_LLM_MODEL") or "deepseek-chat").strip()
     timeout_seconds = timeout_seconds if timeout_seconds is not None else int(
-        os.environ.get("DPSK_TIMEOUT_SECONDS", "60")
+        os.environ.get("SJTU_LLM_TIMEOUT_SECONDS", "60")
     )
-    return DeepSeekConfig(
+    return LLMConfig(
         api_key=api_key,
         api_base=api_base,
         model=resolved_model,
@@ -98,7 +100,7 @@ def _validate_llm_api_base(api_base: str) -> None:
     hostname = (parsed.hostname or "").lower()
     allowed_hosts = {
         host.strip().lower()
-        for host in os.environ.get("DPSK_ALLOWED_BASE_HOSTS", "models.sjtu.edu.cn").split(",")
+        for host in os.environ.get("SJTU_LLM_ALLOWED_BASE_HOSTS", "models.sjtu.edu.cn").split(",")
         if host.strip()
     }
     if parsed.scheme != "https" or not hostname or hostname not in allowed_hosts:
@@ -118,7 +120,7 @@ def generate_shuiyuan_search_plan(
 ) -> ShuiyuanSearchPlan:
     """Use the LLM to plan bridged Shuiyuan search queries."""
 
-    config = load_deepseek_config(
+    config = load_llm_config(
         model=model,
         api_key=api_key,
         api_base=api_base,
@@ -268,7 +270,7 @@ def assess_shuiyuan_evidence(
     api_base: str | None = None,
     timeout_seconds: int | None = None,
 ) -> EvidenceAssessment:
-    config = load_deepseek_config(
+    config = load_llm_config(
         model=model,
         api_key=api_key,
         api_base=api_base,
@@ -367,7 +369,7 @@ def extract_structured_community_evidence(
             "stable_practice_evidence": [],
             "historical_or_uncertain_evidence": [],
         }
-    config = load_deepseek_config(
+    config = load_llm_config(
         model=model,
         api_key=api_key,
         api_base=api_base,
@@ -433,7 +435,7 @@ def build_evidence_ledger(
     api_base: str | None = None,
     timeout_seconds: int | None = None,
 ) -> dict[str, object]:
-    config = load_deepseek_config(
+    config = load_llm_config(
         model=model,
         api_key=api_key,
         api_base=api_base,
@@ -493,7 +495,7 @@ def generate_verified_answer(
     api_base: str | None = None,
     timeout_seconds: int | None = None,
 ) -> str:
-    config = load_deepseek_config(
+    config = load_llm_config(
         model=model,
         api_key=api_key,
         api_base=api_base,
@@ -549,7 +551,7 @@ def generate_verified_answer(
 
 
 def _request_json_object(
-    config: DeepSeekConfig,
+    config: LLMConfig,
     *,
     system: str,
     prompt: str,
@@ -879,7 +881,7 @@ def _strip_json_fence(value: str) -> str:
     return value
 
 
-def _post_chat_completion(config: DeepSeekConfig, payload: dict[str, object]) -> dict[str, object]:
+def _post_chat_completion(config: LLMConfig, payload: dict[str, object]) -> dict[str, object]:
     url = f"{config.api_base}/chat/completions"
     request = Request(
         url,
@@ -894,4 +896,4 @@ def _post_chat_completion(config: DeepSeekConfig, payload: dict[str, object]) ->
         with urlopen(request, timeout=config.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        raise LLMError(f"deepseek request failed: {exc}") from exc
+        raise LLMError(f"LLM request failed: {exc}") from exc

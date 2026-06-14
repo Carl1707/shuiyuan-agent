@@ -51,10 +51,13 @@ cp .env.example .env.local
 在 `.env.local` 中填写校内模型 API Key：
 
 ```dotenv
-DPSK_API_KEY=your-sjtu-model-api-key
-DPSK_API_BASE=https://models.sjtu.edu.cn/api/v1
-DPSK_MODEL=deepseek-chat
+SJTU_LLM_API_KEY=your-sjtu-model-api-key
+SJTU_LLM_API_BASE=https://models.sjtu.edu.cn/api/v1
+SJTU_LLM_MODEL=deepseek-chat
 ```
+
+`SJTU_LLM_MODEL` 可以填写获授权的校内模型调用名，例如
+`deepseek-chat`、`deepseek-reasoner`、`minimax`、`glm` 或 `qwen`。
 
 启动：
 
