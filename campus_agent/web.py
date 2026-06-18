@@ -20,6 +20,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from campus_agent.agent import answer_question
 from campus_agent.llm import load_local_env
 from campus_agent.models import RetrievalResult
+from campus_agent.session_store import SessionMemoryStore
+from campus_agent.session_store import session_to_response
 from campus_agent.tools import CommunitySearchError
 from campus_agent.tools import CommunitySearchResult
 from campus_agent.tools import build_shuiyuan_search_tool
@@ -69,8 +71,9 @@ class AnswerJob:
 
 
 class AnswerJobManager:
-    def __init__(self, *, default_answer_backend: str) -> None:
+    def __init__(self, *, default_answer_backend: str, session_store: SessionMemoryStore) -> None:
         self._default_answer_backend = default_answer_backend
+        self._session_store = session_store
         self._lock = threading.Lock()
         self._jobs: dict[str, AnswerJob] = {}
 
@@ -115,6 +118,7 @@ class AnswerJobManager:
             response = build_answer_response(
                 self._jobs[job_id].payload,
                 default_answer_backend=self._default_answer_backend,
+                session_store=self._session_store,
                 progress_callback=lambda step, message: self._update(job_id, step=step, message=message),
             )
         except Exception as exc:
@@ -247,8 +251,9 @@ def run_web_app(
 
     defaults = _resolve_defaults(default_answer_backend)
     auth_manager = CommunityAuthManager()
-    job_manager = AnswerJobManager(default_answer_backend=defaults.answer_backend)
-    handler = _build_handler(defaults, auth_manager, job_manager)
+    session_store = SessionMemoryStore()
+    job_manager = AnswerJobManager(default_answer_backend=defaults.answer_backend, session_store=session_store)
+    handler = _build_handler(defaults, auth_manager, job_manager, session_store)
     server = ThreadingHTTPServer((host, port), handler)
     print(f"web_ui=http://{host}:{port} backend={defaults.answer_backend}")
     try:
@@ -263,11 +268,30 @@ def build_answer_response(
     payload: dict[str, Any],
     *,
     default_answer_backend: str = "llm",
+    session_store: SessionMemoryStore | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     question = _coerce_text(payload.get("question"))
     if not question:
         raise ValueError("question is required")
+    session_id = _coerce_text(payload.get("session_id"))
+    global_system_prompt = _coerce_text(payload.get("global_system_prompt")) or _coerce_text(payload.get("session_system_prompt"))
+    session_state = None
+    conversation_context: dict[str, object] | None = None
+    if session_store is not None:
+        if _parse_bool(payload.get("reset_session"), default=False) and session_id:
+            session_state = session_store.reset_session(session_id)
+        else:
+            session_state = session_store.ensure_session(session_id)
+        session_id = session_state.session_id
+        conversation_context = {
+            "session_summary": session_state.session_summary,
+            "current_topic": session_state.current_topic,
+            "active_entities": session_state.active_entities,
+            "active_constraints": session_state.active_constraints,
+            "recent_turns": session_state.recent_turns,
+            "artifacts": session_state.artifacts,
+        }
 
     top_k = _parse_positive_int(payload.get("top_k"), default=5)
     question_type = ""
@@ -316,13 +340,27 @@ def build_answer_response(
             llm_api_key=llm_api_key,
             llm_api_base=llm_api_base,
             llm_timeout_seconds=llm_timeout_seconds,
+            conversation_context=conversation_context,
+            session_system_prompt=global_system_prompt,
             progress_callback=progress_callback,
         )
     except CommunitySearchError as exc:
         raise ValueError(str(exc)) from exc
 
+    if session_store is not None and session_state is not None:
+        session_state = session_store.record_turn(
+            session_id=session_state.session_id,
+            user_question=question,
+            resolved_question=str(output.get("resolved_question") or question),
+            answer=str(output.get("answer") or ""),
+            answer_summary=_summarize_answer(str(output.get("answer") or "")),
+            memory_update=output.get("session_memory_update", {}) if isinstance(output.get("session_memory_update"), dict) else {},
+            output=output,
+        )
+
     return {
         "request": {
+            "session_id": session_id,
             "question": question,
             "top_k": top_k,
             "answer_backend": answer_backend,
@@ -341,6 +379,19 @@ def build_answer_response(
             "llm_call_count": int(output.get("llm_call_count", 0) or 0),
             "search_request_count": int(output.get("search_request_count", 0) or 0),
         },
+        "session_id": session_id,
+        "session_state_preview": session_to_response(session_state) if session_state is not None else {},
+        "resolved_question": output.get("resolved_question", question),
+        "is_followup": bool(output.get("is_followup", False)),
+        "context_used": output.get("context_used", {}),
+        "turn_operation": output.get("turn_operation", ""),
+        "reuse_strategy": output.get("reuse_strategy", ""),
+        "target_entity_type": output.get("target_entity_type", ""),
+        "entity_type": output.get("entity_type", ""),
+        "entity_set": output.get("entity_set", []),
+        "entity_merge_notes": output.get("entity_merge_notes", []),
+        "entity_missing_attributes": output.get("entity_missing_attributes", []),
+        "entity_insufficient_entities": output.get("entity_insufficient_entities", []),
         "queries": output["queries"],
         "search_plan": output.get("search_plan", {}),
         "question_understanding": output.get("question_understanding", {}),
@@ -408,10 +459,16 @@ def _resolve_defaults(default_answer_backend: str) -> WebAppDefaults:
     )
 
 
+def _summarize_answer(answer: str) -> str:
+    normalized = " ".join(answer.split()).strip()
+    return normalized[:420]
+
+
 def _build_handler(
     defaults: WebAppDefaults,
     auth_manager: CommunityAuthManager,
     job_manager: AnswerJobManager,
+    session_store: SessionMemoryStore,
 ) -> type[BaseHTTPRequestHandler]:
     homepage = _render_homepage(defaults=defaults)
 
@@ -446,6 +503,21 @@ def _build_handler(
                 except ValueError as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
                 return
+            if parsed.path == "/api/sessions":
+                self._send_json({"sessions": session_store.list_sessions()})
+                return
+            if parsed.path.startswith("/api/sessions/"):
+                session_id = parsed.path.removeprefix("/api/sessions/").strip("/")
+                if not session_id:
+                    self._send_json({"error": "session_id is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    state = session_store.get_session(session_id)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"session": session_to_response(state)})
+                return
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -456,9 +528,15 @@ def _build_handler(
                     response = build_answer_response(
                         payload,
                         default_answer_backend=defaults.answer_backend,
+                        session_store=session_store,
                     )
                 elif parsed.path == "/api/answer/start":
                     response = job_manager.start(payload)
+                elif parsed.path == "/api/sessions":
+                    response = {"session": session_to_response(session_store.create_session())}
+                elif parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/reset"):
+                    session_id = parsed.path.removeprefix("/api/sessions/").removesuffix("/reset").strip("/")
+                    response = {"session": session_to_response(session_store.reset_session(session_id))}
                 elif parsed.path == "/api/community/auth/start":
                     response = build_community_auth_start_response(
                         auth_manager,
@@ -480,6 +558,18 @@ def _build_handler(
                 )
                 return
             self._send_json(response)
+
+        def do_DELETE(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/sessions/"):
+                session_id = parsed.path.removeprefix("/api/sessions/").strip("/")
+                if not session_id:
+                    self._send_json({"error": "session_id is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                session_store.delete_session(session_id)
+                self._send_json({"ok": True})
+                return
+            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def _read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
@@ -594,6 +684,7 @@ def _render_homepage(
               background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
               backdrop-filter: blur(22px);
               overflow: auto;
+              min-width: 0;
             }
             .main {
               min-width: 0;
@@ -926,6 +1017,40 @@ def _render_homepage(
             .details-card {
               overflow: hidden;
             }
+            .session-list {
+              display: grid;
+              gap: 8px;
+              max-height: 240px;
+              overflow: auto;
+            }
+            .session-item {
+              width: 100%;
+              border: 1px solid var(--border);
+              background: transparent;
+              color: var(--text);
+              border-radius: 10px;
+              padding: 10px 12px;
+              text-align: left;
+              cursor: pointer;
+              min-width: 0;
+            }
+            .session-item.active {
+              border-color: var(--accent);
+              background: rgba(81, 104, 207, 0.12);
+            }
+            .session-title {
+              display: block;
+              font-weight: 700;
+              overflow-wrap: anywhere;
+              line-height: 1.45;
+            }
+            .session-meta {
+              display: block;
+              margin-top: 3px;
+              color: var(--muted);
+              font-size: 12px;
+              overflow-wrap: anywhere;
+            }
             .details-card details {
               border-top: 1px solid var(--border);
             }
@@ -964,12 +1089,17 @@ def _render_homepage(
               .app-shell { grid-template-columns: 1fr; }
               .sidebar {
                 position: fixed;
-                inset: 0 auto 0 0;
-                width: min(420px, 100vw);
+                inset: 0;
+                width: 100vw;
+                max-width: 100vw;
+                height: 100vh;
                 z-index: 15;
                 transform: translateX(-102%);
                 transition: transform 180ms ease;
                 background: var(--bg-2);
+                border-right: 0;
+                padding: 16px;
+                box-shadow: 0 24px 56px rgba(15, 23, 42, 0.28);
               }
               .sidebar.open { transform: translateX(0); }
               .mobile-settings-toggle { display: inline-flex; }
@@ -980,6 +1110,9 @@ def _render_homepage(
               .field-grid, .two-col, .progress-steps { grid-template-columns: 1fr; }
               .brand-copy strong { font-size: 22px; }
               .topbar { padding: 16px; }
+              .sidebar-block { padding: 16px; }
+              .actions { gap: 10px; }
+              .actions button { flex: 1 1 calc(50% - 10px); }
             }
           </style>
         </head>
@@ -995,6 +1128,22 @@ def _render_homepage(
               </div>
 
               <form id="ask-form" class="stack">
+                <div class="sidebar-block">
+                  <div class="section-title">
+                    <h3>历史对话</h3>
+                    <button id="new-session-btn" class="ghost subtle" type="button">新建</button>
+                  </div>
+                  <div id="session-list" class="session-list"></div>
+                  <div class="actions">
+                    <button id="reset-session-btn" class="ghost" type="button">清空上下文</button>
+                    <button id="delete-session-btn" class="ghost subtle" type="button">删除当前</button>
+                  </div>
+                  <div class="section">
+                    <label class="label" for="global_system_prompt">全局对话偏好</label>
+                    <textarea id="global_system_prompt" autocomplete="off" placeholder="例如：回答简洁，先给结论，再列参考帖子。"></textarea>
+                  </div>
+                </div>
+
                 <div class="sidebar-block">
                   <div class="setup-guide">
                     <div class="setup-step">
@@ -1046,7 +1195,7 @@ def _render_homepage(
                     <button id="community-auth-start-btn" class="primary" type="button">开始只读授权</button>
                     <button id="community-auth-complete-btn" class="ghost" type="button">完成授权</button>
                   </div>
-                  <div class="section security-note">仅申请 Discourse <code>read</code> scope。User-Api-Key 只在当前页面会话中使用，不写入浏览器存储。</div>
+                  <div class="section security-note">仅申请 Discourse <code>read</code> scope。User-Api-Key 保存在本浏览器，用于下次打开时自动复用，不写入后端会话库。</div>
                   <input id="community_user_api_client_id" type="hidden" />
                   <input id="community_user_api_key" type="hidden" />
                   <input id="community_application_name" type="hidden" value="Shuiyuan Agent" />
@@ -1117,7 +1266,7 @@ def _render_homepage(
                       <div class="progress-step" data-step="generating"><strong>6. 答案校验</strong><span>生成并核对最终回答</span></div>
                     </div>
                   </div>
-                  <div class="chat-stream">
+                  <div id="chat-stream" class="chat-stream">
                     <div class="message system">
                       <div class="avatar">S</div>
                       <div class="bubble">
@@ -1126,28 +1275,10 @@ def _render_homepage(
                           <span class="small">只读社区搜索</span>
                         </div>
                         <div class="msg-body">先在设置中完成校内模型配置和 Shuiyuan 只读授权。提问后，系统会规划多组短查询、审计证据并按需阅读高相关帖子正文。</div>
+                        <div id="request-pills" class="pill-row"></div>
                       </div>
                     </div>
 
-                    <div class="message user">
-                      <div class="bubble">
-                        <div class="message-head">
-                          <strong>你的问题</strong>
-                        </div>
-                        <div id="question-preview" class="msg-body">还没有输入问题。</div>
-                      </div>
-                    </div>
-
-                    <div class="message assistant">
-                      <div class="avatar">A</div>
-                      <div class="bubble">
-                        <div class="message-head">
-                          <strong>回答</strong>
-                          <div id="request-pills" class="pill-row"></div>
-                        </div>
-                        <div id="answer-box" class="assistant-answer">回答会显示在这里。</div>
-                      </div>
-                    </div>
                   </div>
                   <div id="status-line" class="status-line">等待提问。</div>
                 </article>
@@ -1156,6 +1287,10 @@ def _render_homepage(
                   <details open>
                     <summary>搜索计划 <span id="plan-intent" class="small">尚未生成 intent。</span></summary>
                     <div class="details-body">
+                      <div class="section">
+                        <div class="small">理解后的问题</div>
+                        <div id="resolved-question" class="citation-list"></div>
+                      </div>
                       <div class="section">
                         <div class="small">问题理解</div>
                         <div id="question-understanding" class="citation-list"></div>
@@ -1243,6 +1378,12 @@ def _render_homepage(
 
           <script>
             const APP_CONFIG = __APP_CONFIG__;
+            const STORAGE_KEYS = {
+              shuiyuanKey: "shuiyuan-agent-shuiyuan-key",
+              shuiyuanClientId: "shuiyuan-agent-shuiyuan-client-id",
+              globalPrompt: "shuiyuan-agent-global-prompt",
+              activeSessionId: "shuiyuan-agent-active-session-id",
+            };
             const state = {
               lastAnswer: "",
               lastAuthUrl: "",
@@ -1250,12 +1391,14 @@ def _render_homepage(
               progressTimer: null,
               progressStartedAt: 0,
               currentJobId: "",
+              activeSessionId: localStorage.getItem(STORAGE_KEYS.activeSessionId) || "",
+              sessions: [],
             };
 
             const elements = {
               form: document.getElementById("ask-form"),
               question: document.getElementById("question"),
-              questionPreview: document.getElementById("question-preview"),
+              chatStream: document.getElementById("chat-stream"),
               topK: document.getElementById("top_k"),
               useBodyRag: document.getElementById("use_body_rag"),
               apiKey: document.getElementById("api_key"),
@@ -1270,6 +1413,11 @@ def _render_homepage(
               communityEncryptedPayload: document.getElementById("community_encrypted_payload"),
               communityAuthStartBtn: document.getElementById("community-auth-start-btn"),
               communityAuthCompleteBtn: document.getElementById("community-auth-complete-btn"),
+              sessionList: document.getElementById("session-list"),
+              newSessionBtn: document.getElementById("new-session-btn"),
+              resetSessionBtn: document.getElementById("reset-session-btn"),
+              deleteSessionBtn: document.getElementById("delete-session-btn"),
+              globalSystemPrompt: document.getElementById("global_system_prompt"),
               openSidebarBtn: document.getElementById("open-sidebar-btn"),
               closeSidebarBtn: document.getElementById("close-sidebar-btn"),
               toggleThemeBtn: document.getElementById("toggle-theme-btn"),
@@ -1280,8 +1428,8 @@ def _render_homepage(
               progressMessage: document.getElementById("progress-message"),
               progressTime: document.getElementById("progress-time"),
               progressSteps: Array.from(document.querySelectorAll(".progress-step")),
-              answerBox: document.getElementById("answer-box"),
               planIntent: document.getElementById("plan-intent"),
+              resolvedQuestion: document.getElementById("resolved-question"),
               questionUnderstanding: document.getElementById("question-understanding"),
               searchViews: document.getElementById("search-views"),
               coverageAxes: document.getElementById("coverage-axes"),
@@ -1303,6 +1451,9 @@ def _render_homepage(
             document.body.dataset.theme = state.theme;
             elements.llmModel.value = APP_CONFIG.default_model;
             elements.communityBaseUrl.value = APP_CONFIG.default_community_base_url;
+            elements.communityUserApiKey.value = localStorage.getItem(STORAGE_KEYS.shuiyuanKey) || "";
+            elements.communityClientId.value = localStorage.getItem(STORAGE_KEYS.shuiyuanClientId) || "";
+            elements.globalSystemPrompt.value = localStorage.getItem(STORAGE_KEYS.globalPrompt) || localStorage.getItem("shuiyuan-agent-session-prompt") || "";
 
             function updateSetupState() {
               const llmReady = APP_CONFIG.llm_configured || Boolean(elements.apiKey.value.trim());
@@ -1311,6 +1462,147 @@ def _render_homepage(
               elements.llmReadyState.classList.toggle("ready", llmReady);
               elements.communityReadyState.textContent = communityReady ? "已授权" : "待授权";
               elements.communityReadyState.classList.toggle("ready", communityReady);
+            }
+
+            function renderSessionList() {
+              clearNode(elements.sessionList);
+              if (!state.sessions.length) {
+                const empty = document.createElement("div");
+                empty.className = "helper-text";
+                empty.textContent = "还没有历史对话。";
+                elements.sessionList.appendChild(empty);
+                return;
+              }
+              state.sessions.forEach((session) => {
+                const item = document.createElement("button");
+                item.type = "button";
+                item.className = "session-item";
+                item.classList.toggle("active", session.session_id === state.activeSessionId);
+                item.dataset.sessionId = session.session_id;
+                const title = document.createElement("span");
+                title.className = "session-title";
+                title.textContent = session.title || "新对话";
+                const meta = document.createElement("span");
+                meta.className = "session-meta";
+                const updated = session.updated_at ? new Date(session.updated_at * 1000).toLocaleString() : "";
+                meta.textContent = session.current_topic ? `${session.current_topic} · ${updated}` : updated;
+                item.appendChild(title);
+                item.appendChild(meta);
+                item.addEventListener("click", () => selectSession(session.session_id));
+                elements.sessionList.appendChild(item);
+              });
+            }
+
+            function appendMessage(role, content, meta = "") {
+              const message = document.createElement("div");
+              message.className = `message ${role}`;
+              if (role !== "user") {
+                const avatar = document.createElement("div");
+                avatar.className = "avatar";
+                avatar.textContent = role === "assistant" ? "A" : "S";
+                message.appendChild(avatar);
+              }
+              const bubble = document.createElement("div");
+              bubble.className = "bubble";
+              const head = document.createElement("div");
+              head.className = "message-head";
+              const label = document.createElement("strong");
+              label.textContent = role === "user" ? "你的问题" : "回答";
+              head.appendChild(label);
+              if (meta) {
+                const small = document.createElement("span");
+                small.className = "small";
+                small.textContent = meta;
+                head.appendChild(small);
+              }
+              const body = document.createElement("div");
+              body.className = role === "assistant" ? "assistant-answer" : "msg-body";
+              if (role === "assistant") {
+                body.innerHTML = linkifyAndFormat(content || "未生成回答。");
+              } else {
+                body.textContent = content || "";
+              }
+              bubble.appendChild(head);
+              bubble.appendChild(body);
+              message.appendChild(bubble);
+              elements.chatStream.appendChild(message);
+              elements.chatStream.scrollTop = elements.chatStream.scrollHeight;
+              return message;
+            }
+
+            function clearConversationMessages() {
+              Array.from(elements.chatStream.querySelectorAll(".message.user, .message.assistant")).forEach((node) => node.remove());
+            }
+
+            function renderSessionTurns(turns) {
+              clearConversationMessages();
+              if (!turns || !turns.length) return;
+              turns.forEach((turn) => {
+                appendMessage("user", turn.user_question || "");
+                appendMessage("assistant", turn.answer || "", turn.resolved_question ? `理解为：${turn.resolved_question}` : "");
+              });
+              const last = turns[turns.length - 1];
+              state.lastAnswer = (last && last.answer) || "";
+            }
+
+            async function loadSessions() {
+              const response = await fetch("/api/sessions");
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+              state.sessions = data.sessions || [];
+              if (!state.activeSessionId || !state.sessions.some((item) => item.session_id === state.activeSessionId)) {
+                if (state.sessions.length) {
+                  state.activeSessionId = state.sessions[0].session_id;
+                } else {
+                  const created = await postJson("/api/sessions", {});
+                  state.activeSessionId = created.session.session_id;
+                  state.sessions = [created.session];
+                }
+              }
+              localStorage.setItem(STORAGE_KEYS.activeSessionId, state.activeSessionId);
+              renderSessionList();
+            }
+
+            async function selectSession(sessionId) {
+              state.activeSessionId = sessionId;
+              localStorage.setItem(STORAGE_KEYS.activeSessionId, sessionId);
+              renderSessionList();
+              try {
+                const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                const turns = (data.session && data.session.recent_turns) || [];
+                renderSessionTurns(turns);
+              } catch (error) {
+                setStatus(error.message || String(error), "error");
+              }
+            }
+
+            async function createSession() {
+              const data = await postJson("/api/sessions", {});
+              state.activeSessionId = data.session.session_id;
+              localStorage.setItem(STORAGE_KEYS.activeSessionId, state.activeSessionId);
+              await loadSessions();
+              await selectSession(state.activeSessionId);
+            }
+
+            async function resetCurrentSession() {
+              if (!state.activeSessionId) return;
+              const data = await postJson(`/api/sessions/${encodeURIComponent(state.activeSessionId)}/reset`, {});
+              state.activeSessionId = data.session.session_id;
+              await loadSessions();
+              await selectSession(state.activeSessionId);
+            }
+
+            async function deleteCurrentSession() {
+              if (!state.activeSessionId) return;
+              const response = await fetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, { method: "DELETE" });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+              state.activeSessionId = "";
+              localStorage.removeItem(STORAGE_KEYS.activeSessionId);
+              await loadSessions();
+              await selectSession(state.activeSessionId);
             }
 
             function setStatus(message, kind = "") {
@@ -1377,6 +1669,7 @@ def _render_homepage(
             }
 
             function clearNode(node) {
+              if (!node) return;
               while (node.firstChild) node.removeChild(node.firstChild);
             }
 
@@ -1393,7 +1686,16 @@ def _render_homepage(
               const escaped = escapeHtml(text);
               const linked = escaped.replace(
                 new RegExp("(https?://[^\\\\s<]+)", "g"),
-                '<a href="$1" target="_blank" rel="noreferrer">$1</a>'
+                (match) => {
+                  let url = match;
+                  let trailing = "";
+                  while (/[)\\]\\}.!?,;:]/.test(url.slice(-1))) {
+                    trailing = url.slice(-1) + trailing;
+                    url = url.slice(0, -1);
+                  }
+                  if (!url) return match;
+                  return `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>${trailing}`;
+                }
               );
               return linked
                 .replace(/[*][*]([^*]+)[*][*]/g, "<strong>$1</strong>")
@@ -1408,6 +1710,7 @@ def _render_homepage(
             }
 
             function renderPills(container, items) {
+              if (!container) return;
               clearNode(container);
               if (!items.length) {
                 container.appendChild(createPill("无"));
@@ -1417,6 +1720,7 @@ def _render_homepage(
             }
 
             function renderCards(container, items, emptyText, isCommunity = false) {
+              if (!container) return;
               clearNode(container);
               if (!items.length) {
                 const empty = document.createElement("div");
@@ -1456,6 +1760,7 @@ def _render_homepage(
             }
 
             function renderStructured(container, value, emptyText) {
+              if (!container) return;
               clearNode(container);
               if (!value || (Array.isArray(value) && !value.length) || (typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length)) {
                 const empty = document.createElement("div");
@@ -1550,16 +1855,42 @@ def _render_homepage(
             elements.openSidebarBtn.addEventListener("click", () => setSidebarOpen(true));
             elements.closeSidebarBtn.addEventListener("click", () => setSidebarOpen(false));
 
-            elements.question.addEventListener("input", () => {
-              elements.questionPreview.textContent = elements.question.value.trim() || "还没有输入问题。";
-            });
             elements.question.addEventListener("keydown", (event) => {
               if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                 event.preventDefault();
                 elements.form.requestSubmit();
               }
             });
-            elements.apiKey.addEventListener("input", updateSetupState);
+            elements.apiKey.addEventListener("input", () => {
+              updateSetupState();
+            });
+            elements.globalSystemPrompt.addEventListener("input", () => {
+              localStorage.setItem(STORAGE_KEYS.globalPrompt, elements.globalSystemPrompt.value);
+            });
+            elements.newSessionBtn.addEventListener("click", async () => {
+              try {
+                await createSession();
+                setStatus("已新建对话。", "ready");
+              } catch (error) {
+                setStatus(error.message || String(error), "error");
+              }
+            });
+            elements.resetSessionBtn.addEventListener("click", async () => {
+              try {
+                await resetCurrentSession();
+                setStatus("当前对话上下文已清空。", "ready");
+              } catch (error) {
+                setStatus(error.message || String(error), "error");
+              }
+            });
+            elements.deleteSessionBtn.addEventListener("click", async () => {
+              try {
+                await deleteCurrentSession();
+                setStatus("当前对话已删除。", "ready");
+              } catch (error) {
+                setStatus(error.message || String(error), "error");
+              }
+            });
 
             elements.communityAuthStartBtn.addEventListener("click", async () => {
               try {
@@ -1587,6 +1918,8 @@ def _render_homepage(
                 });
                 elements.communityUserApiKey.value = data.user_api_key || "";
                 elements.communityClientId.value = data.client_id || elements.communityClientId.value;
+                localStorage.setItem(STORAGE_KEYS.shuiyuanKey, elements.communityUserApiKey.value);
+                localStorage.setItem(STORAGE_KEYS.shuiyuanClientId, elements.communityClientId.value);
                 elements.communityEncryptedPayload.value = "";
                 updateSetupState();
                 setStatus("Shuiyuan User-Api-Key 已就绪。现在可以直接提问并带上社区搜索。", "ready");
@@ -1626,6 +1959,8 @@ def _render_homepage(
                 return;
               }
               const payload = {
+                session_id: state.activeSessionId,
+                global_system_prompt: elements.globalSystemPrompt.value.trim(),
                 question,
                 top_k: Number(elements.topK.value) || 5,
                 use_body_rag: elements.useBodyRag.checked,
@@ -1640,16 +1975,31 @@ def _render_homepage(
 
               elements.submitBtn.disabled = true;
               setStatus("正在处理中...", "working");
-              elements.questionPreview.textContent = question;
+              appendMessage("user", question);
               setProgressState("query_planning", "请求已提交，准备开始。", 0, "running");
               startProgressClock();
               try {
                 const started = await postJson("/api/answer/start", payload);
                 state.currentJobId = started.job_id || "";
                 const data = await pollAnswerJob(state.currentJobId);
+                state.activeSessionId = data.session_id || state.activeSessionId;
+                localStorage.setItem(STORAGE_KEYS.activeSessionId, state.activeSessionId);
                 state.lastAnswer = data.answer || "";
-                elements.answerBox.innerHTML = linkifyAndFormat(data.answer || "未生成回答。");
+                appendMessage(
+                  "assistant",
+                  data.answer || "未生成回答。",
+                  data.resolved_question && data.resolved_question !== question ? `理解为：${data.resolved_question}` : ""
+                );
                 elements.planIntent.textContent = (data.search_plan && data.search_plan.intent) || "未生成 intent。";
+                renderStructured(elements.resolvedQuestion, {
+                  resolved_question: data.resolved_question || question,
+                  is_followup: Boolean(data.is_followup),
+                  turn_operation: data.turn_operation || "",
+                  reuse_strategy: data.reuse_strategy || "",
+                  target_entity_type: data.target_entity_type || "",
+                  required_attributes: (data.context_used && data.context_used.required_attributes) || [],
+                  active_entities: (data.context_used && data.context_used.active_entities) || [],
+                }, "未生成上下文问题。");
                 renderStructured(elements.questionUnderstanding, data.question_understanding || {}, "未生成问题理解。");
                 renderPills(elements.searchViews, data.search_views || []);
                 renderPills(elements.coverageAxes, data.coverage_axes || []);
@@ -1659,18 +2009,28 @@ def _render_homepage(
                 renderStructured(elements.rejectedQueries, data.rejected_query_details || [], "没有淘汰 query。");
                 renderStructured(elements.answerContract, data.answer_contract || {}, "未生成动态答案目标。");
                 renderStructured(elements.coverageAssessments, data.coverage_assessments || [], "未执行证据覆盖审计。");
-                renderStructured(elements.candidateProfiles, data.candidate_profiles || [], "没有执行候选对象归并。");
+                renderStructured(elements.candidateProfiles, {
+                  candidate_profiles: data.candidate_profiles || [],
+                  entity_type: data.entity_type || "",
+                  entity_set: data.entity_set || [],
+                  entity_merge_notes: data.entity_merge_notes || [],
+                  missing_attributes: data.entity_missing_attributes || [],
+                  insufficient_entities: data.entity_insufficient_entities || [],
+                }, "没有执行候选对象归并。");
                 renderStructured(elements.evidenceLedger, data.evidence_ledger || {}, "未生成事实账本。");
                 renderCards(elements.results, data.results || [], "没有命中帖子正文片段。", false);
                 renderCards(elements.communityResults, data.community_results || [], "没有找到相关 Shuiyuan 帖子。", true);
                 const request = data.request || payload;
                 request.executed_query_count = (data.queries || []).length;
                 renderRequestPills(request);
+                await loadSessions();
+                renderSessionList();
                 setStatus("回答已生成。", "ready");
                 setProgressState("generating", "回答已生成。", null, "completed");
                 setSidebarOpen(false);
               } catch (error) {
                 setStatus(error.message || String(error), "error");
+                appendMessage("assistant", error.message || String(error), "请求失败");
                 setProgressState("generating", error.message || String(error), null, "error");
               } finally {
                 stopProgressClock();
@@ -1680,6 +2040,7 @@ def _render_homepage(
 
             setTheme(state.theme);
             updateSetupState();
+            loadSessions().catch((error) => setStatus(error.message || String(error), "error"));
             loadHealth();
             setProgressState("", "等待提问。", 0, "idle");
             renderRequestPills({

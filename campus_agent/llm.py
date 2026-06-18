@@ -53,6 +53,25 @@ class EvidenceAssessment:
     evidence_roles: list[dict[str, str]] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class ContextualQuestion:
+    is_followup: bool
+    resolved_question: str
+    current_topic: str = ""
+    turn_operation: str = "new_topic"
+    reuse_strategy: str = "full_refresh"
+    target_entity_type: str = "unknown"
+    required_attributes: list[str] = field(default_factory=list)
+    candidate_filters: list[str] = field(default_factory=list)
+    active_entities: list[str] = field(default_factory=list)
+    active_constraints: list[str] = field(default_factory=list)
+    dropped_context: list[str] = field(default_factory=list)
+    retrieval_instruction: str = ""
+    answer_style_instruction: str = ""
+    session_summary: str = ""
+    open_questions: list[str] = field(default_factory=list)
+
+
 _DEFAULT_QUESTION_UNDERSTANDING = {
     "user_goal": "",
     "result_shape": "single_best",
@@ -63,6 +82,97 @@ _DEFAULT_QUESTION_UNDERSTANDING = {
     "evidence_priority": [],
     "known_risks": [],
 }
+
+
+def resolve_contextual_question(
+    *,
+    question: str,
+    conversation_context: dict[str, object] | None = None,
+    session_system_prompt: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    timeout_seconds: int | None = None,
+) -> ContextualQuestion:
+    """Resolve short follow-up questions against session-local memory."""
+
+    config = load_llm_config(
+        model=model,
+        api_key=api_key,
+        api_base=api_base,
+        timeout_seconds=timeout_seconds,
+    )
+    context = conversation_context or {}
+    prompt = (
+        f"当前日期：{date.today().isoformat()}。\n"
+        f"用户当前问题：{question}\n"
+        f"全局对话偏好：{session_system_prompt or ''}\n"
+        f"会话上下文：{json.dumps(context, ensure_ascii=False)}\n\n"
+        "请判断当前问题是否是在追问本会话中的已有主题。"
+        "如果是追问，请把省略的对象、校区、时间、主题和约束补全为一个可独立检索的问题。"
+        "如果用户切换到了新话题，不要继承旧主题约束。"
+        "全局对话偏好只能作为回答风格或来源偏好的提示，不能覆盖证据规则。"
+        "输出 JSON，字段固定为 is_followup、resolved_question、current_topic、turn_operation、"
+        "reuse_strategy、target_entity_type、required_attributes、candidate_filters、"
+        "active_entities、active_constraints、dropped_context、retrieval_instruction、"
+        "answer_style_instruction、session_summary、open_questions。"
+        "resolved_question 必须是自然中文问题，适合继续交给 Shuiyuan 搜索规划器。"
+        "active_entities 和 active_constraints 只保留当前轮仍然有效的信息。"
+        "turn_operation 只能是 new_topic、refine_scope、filter_candidates、compare_candidates、fill_missing_attributes。"
+        "reuse_strategy 只能是 reuse_only、reuse_then_expand、full_refresh。"
+        "target_entity_type 只能是 person、lab、course、location、department、unknown。"
+        "如果当前问题是在上一轮候选对象里继续筛选、比较或补属性，优先使用 reuse_only 或 reuse_then_expand，不要默认 full_refresh。"
+    )
+    parsed = _request_json_object(
+        config,
+        system="你是对话上下文解析器。严格只输出 JSON 对象。",
+        prompt=prompt,
+        temperature=0.1,
+    )
+    return _normalize_contextual_question(parsed, question)
+
+
+def synthesize_entities_from_evidence(
+    *,
+    question: str,
+    question_understanding: dict[str, object] | None,
+    contextual_question: ContextualQuestion,
+    evidence_items: list[dict[str, object]],
+    structured_evidence: dict[str, object] | None = None,
+    previous_entity_set: list[dict[str, object]] | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    timeout_seconds: int | None = None,
+) -> dict[str, object]:
+    config = load_llm_config(
+        model=model,
+        api_key=api_key,
+        api_base=api_base,
+        timeout_seconds=timeout_seconds,
+    )
+    prompt = (
+        f"当前日期：{date.today().isoformat()}。\n"
+        f"用户问题：{question}\n"
+        f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
+        f"多轮操作：{json.dumps(_contextual_question_to_dict(contextual_question), ensure_ascii=False)}\n"
+        f"上一轮对象集合：{json.dumps(previous_entity_set or [], ensure_ascii=False)}\n"
+        f"结构化正文证据：{json.dumps(structured_evidence or {}, ensure_ascii=False)}\n"
+        f"候选证据：{json.dumps(evidence_items[:40], ensure_ascii=False)}\n\n"
+        "请把证据整理成对象集合，而不是帖子集合。"
+        "如果这是追问筛选或补属性，优先复用上一轮对象集合，只在当前证据直接支持时更新或过滤。"
+        "输出 JSON，字段固定为 entity_type、entity_set、entity_merge_notes、missing_attributes、insufficient_entities。"
+        "entity_set 每项包含 entity_id、entity_name、entity_type、aliases、attributes、evidence_urls、evidence_ids、confidence。"
+        "attributes 是对象属性字典，例如学院、方向、岗位、窗口、时间、地点等。"
+        "如果证据只说明某对象与主题相关，可以保留，但不要把整段帖子摘要塞进 attributes。"
+    )
+    parsed = _request_json_object(
+        config,
+        system="你是对象级证据归并器。严格只输出 JSON 对象。",
+        prompt=prompt,
+        temperature=0.1,
+    )
+    return _normalize_entity_synthesis(parsed, contextual_question)
 
 
 def load_local_env() -> None:
@@ -596,6 +706,10 @@ def generate_verified_answer(
     evidence_ledger: dict[str, object],
     evidence_items: list[dict[str, object]],
     structured_evidence: dict[str, object] | None = None,
+    entity_set: list[dict[str, object]] | None = None,
+    turn_operation: str = "new_topic",
+    required_attributes: list[str] | None = None,
+    session_answer_instruction: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
     api_base: str | None = None,
@@ -613,14 +727,24 @@ def generate_verified_answer(
         f"问题形状：{question_shape}\n"
         f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
         f"动态答案契约：{json.dumps(answer_contract, ensure_ascii=False)}\n"
+        f"当前对象集合：{json.dumps(entity_set or [], ensure_ascii=False)}\n"
+        f"当前追问操作：{turn_operation}\n"
+        f"本轮重点补全属性：{json.dumps(required_attributes or [], ensure_ascii=False)}\n"
         f"结构化正文证据：{json.dumps(structured_evidence or {}, ensure_ascii=False)}\n"
         f"事实账本：{json.dumps(evidence_ledger, ensure_ascii=False)}\n"
         f"证据索引：{json.dumps(evidence_items[:40], ensure_ascii=False)}\n\n"
+        f"全局对话偏好：{session_answer_instruction or ''}\n"
         "请生成自然、直接、可执行的中文回答。优先使用 current_answers 和 direct_answers 正面回答用户；"
         "如果问题形状是 enumeration，可把 stable_support 和 useful_support 中能够补全实体信息的内容合并进主体答案，"
         "但当前预约规则、开放时间、人数限制等若无法确认，要单独标出“当前未完全确认”；"
         "如果问题理解中的 organization_strategy 是 by_entities 或 by_options，优先按对象或选项分条组织；"
         "不要按帖子顺序拼接内容。"
+        "如果当前对象集合非空，且 turn_operation 不是 new_topic，优先把回答组织成“对象级总结”，"
+        "也就是先按对象名称列出，再只补该对象当前能确认的属性；"
+        "不要把帖子摘要原样抄进答案，也不要把对象集合退化回帖子列表。"
+        "如果 required_attributes 非空，优先回答这些属性，无法确认的属性应明确写“当前帖子未确认”。"
+        "对于 refine_scope、filter_candidates、compare_candidates、fill_missing_attributes 这几类追问，"
+        "默认继承上一轮对象范围，除非新证据明确引入了新的关键对象。"
         "如果问题形状是 time_sensitive_rule，先写“当前能确认的规则/流程”，再写“社区经验补充/准备建议”，"
         "historical_background 只能用于解释“过去有人这样说过，但不能视为现行规则”；"
         "time_sensitive_rule 回答应先用一两句话说明当前状态和共通流程，并明确所有日期与规则对应的证据年份；"
@@ -638,7 +762,9 @@ def generate_verified_answer(
         "除非证据直接支持，否则不要输出固定的学积分/GPA门槛、明确日期、固定费用或资格条件。"
         "若证据中只有往年经验或年份冲突，必须明确写出“以当年/最新通知为准”或“现有帖子不足以确认当前规则”。"
         "answer_contract.hard_constraints 中列出的限制必须遵守。"
+        "全局对话偏好只能影响表达风格、详略和组织方式，不能覆盖证据约束。"
         "回答结尾单独列出“参考帖子”，使用证据索引中的标题与可跳转 URL。"
+        "如果对象集合里已经有 evidence_urls，可优先从这些 URL 里选参考帖子。"
     )
     payload = {
         "model": config.model,
@@ -686,6 +812,10 @@ def _request_json_object(
 
 def _list_value(value: object) -> list[object]:
     return value if isinstance(value, list) else []
+
+
+def _text(value: object) -> str:
+    return " ".join(str(value or "").split()).strip()
 
 
 def _normalize_query_details(items: list[object], *, limit: int) -> list[dict[str, str]]:
@@ -850,6 +980,90 @@ def _normalize_question_understanding(value: object, question: str) -> dict[str,
     return understanding
 
 
+def _normalize_contextual_question(value: object, question: str) -> ContextualQuestion:
+    raw = value if isinstance(value, dict) else {}
+    resolved = _text(raw.get("resolved_question")) or question
+    return ContextualQuestion(
+        is_followup=bool(raw.get("is_followup", False)),
+        resolved_question=resolved,
+        current_topic=_text(raw.get("current_topic")),
+        turn_operation=_normalize_turn_operation(raw.get("turn_operation"), is_followup=bool(raw.get("is_followup", False))),
+        reuse_strategy=_normalize_reuse_strategy(raw.get("reuse_strategy"), is_followup=bool(raw.get("is_followup", False))),
+        target_entity_type=_normalize_target_entity_type(raw.get("target_entity_type")),
+        required_attributes=_dedupe_text_items(_list_value(raw.get("required_attributes")), limit=8),
+        candidate_filters=_dedupe_text_items(_list_value(raw.get("candidate_filters")), limit=8),
+        active_entities=_dedupe_text_items(_list_value(raw.get("active_entities")), limit=10),
+        active_constraints=_dedupe_text_items(_list_value(raw.get("active_constraints")), limit=10),
+        dropped_context=_dedupe_text_items(_list_value(raw.get("dropped_context")), limit=10),
+        retrieval_instruction=_text(raw.get("retrieval_instruction")),
+        answer_style_instruction=_text(raw.get("answer_style_instruction")),
+        session_summary=_text(raw.get("session_summary")),
+        open_questions=_dedupe_text_items(_list_value(raw.get("open_questions")), limit=10),
+    )
+
+
+def _normalize_entity_synthesis(value: object, contextual_question: ContextualQuestion) -> dict[str, object]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "entity_type": _normalize_target_entity_type(raw.get("entity_type") or contextual_question.target_entity_type),
+        "entity_set": _normalize_entity_set(raw.get("entity_set")),
+        "entity_merge_notes": _dedupe_text_items(_list_value(raw.get("entity_merge_notes")), limit=10),
+        "missing_attributes": _dedupe_text_items(_list_value(raw.get("missing_attributes")), limit=10),
+        "insufficient_entities": _dedupe_text_items(_list_value(raw.get("insufficient_entities")), limit=10),
+    }
+
+
+def _contextual_question_to_dict(value: ContextualQuestion) -> dict[str, object]:
+    return {
+        "is_followup": value.is_followup,
+        "resolved_question": value.resolved_question,
+        "current_topic": value.current_topic,
+        "turn_operation": value.turn_operation,
+        "reuse_strategy": value.reuse_strategy,
+        "target_entity_type": value.target_entity_type,
+        "required_attributes": value.required_attributes,
+        "candidate_filters": value.candidate_filters,
+        "active_entities": value.active_entities,
+        "active_constraints": value.active_constraints,
+        "dropped_context": value.dropped_context,
+        "retrieval_instruction": value.retrieval_instruction,
+        "answer_style_instruction": value.answer_style_instruction,
+        "session_summary": value.session_summary,
+        "open_questions": value.open_questions,
+    }
+
+
+def _normalize_entity_set(value: object) -> list[dict[str, object]]:
+    entities: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in _list_value(value):
+        if not isinstance(item, dict):
+            continue
+        entity_name = _text(item.get("entity_name"))
+        if not entity_name:
+            continue
+        entity_id = _text(item.get("entity_id")) or entity_name
+        if entity_id in seen:
+            continue
+        seen.add(entity_id)
+        attributes = item.get("attributes")
+        entities.append(
+            {
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+                "entity_type": _normalize_target_entity_type(item.get("entity_type")),
+                "aliases": _dedupe_text_items(_list_value(item.get("aliases")), limit=8),
+                "attributes": attributes if isinstance(attributes, dict) else {},
+                "evidence_urls": _dedupe_text_items(_list_value(item.get("evidence_urls")), limit=10),
+                "evidence_ids": _dedupe_text_items(_list_value(item.get("evidence_ids")), limit=12),
+                "confidence": _normalize_confidence(item.get("confidence")),
+            }
+        )
+        if len(entities) >= 20:
+            break
+    return entities
+
+
 def _normalize_topic_choices(
     items: list[object],
     evidence: list[dict[str, object]],
@@ -882,6 +1096,33 @@ def _normalize_result_shape(value: object) -> str:
     shape = str(value or "").strip()
     allowed = {"single_best", "actionable_steps", "broad_options", "current_rule", "compare_options"}
     return shape if shape in allowed else "single_best"
+
+
+def _normalize_turn_operation(value: object, *, is_followup: bool) -> str:
+    operation = str(value or "").strip()
+    allowed = {"new_topic", "refine_scope", "filter_candidates", "compare_candidates", "fill_missing_attributes"}
+    if operation in allowed:
+        return operation
+    return "refine_scope" if is_followup else "new_topic"
+
+
+def _normalize_reuse_strategy(value: object, *, is_followup: bool) -> str:
+    strategy = str(value or "").strip()
+    allowed = {"reuse_only", "reuse_then_expand", "full_refresh"}
+    if strategy in allowed:
+        return strategy
+    return "reuse_then_expand" if is_followup else "full_refresh"
+
+
+def _normalize_target_entity_type(value: object) -> str:
+    entity_type = str(value or "").strip()
+    allowed = {"person", "lab", "course", "location", "department", "unknown"}
+    return entity_type if entity_type in allowed else "unknown"
+
+
+def _normalize_confidence(value: object) -> str:
+    confidence = str(value or "").strip().lower()
+    return confidence if confidence in {"high", "medium", "low"} else "medium"
 
 
 def _normalize_coverage_expectation(value: object) -> str:

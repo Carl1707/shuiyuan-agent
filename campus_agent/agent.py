@@ -8,6 +8,7 @@ from dataclasses import replace
 from campus_agent.chunking import chunk_document
 from campus_agent.retrieval import retrieve, tokenize
 from campus_agent.llm import (
+    ContextualQuestion,
     EvidenceAssessment,
     LLMError,
     ShuiyuanSearchPlan,
@@ -17,6 +18,8 @@ from campus_agent.llm import (
     extract_structured_community_evidence,
     generate_shuiyuan_search_plan,
     generate_verified_answer,
+    resolve_contextual_question,
+    synthesize_entities_from_evidence,
 )
 from campus_agent.models import Chunk, Document, RetrievalResult
 from campus_agent.tools import CommunityDocument, CommunityPost, CommunitySearchResult, CommunitySearchTool
@@ -73,10 +76,25 @@ def answer_question(
     llm_api_key: str | None = None,
     llm_api_base: str | None = None,
     llm_timeout_seconds: int | None = None,
+    conversation_context: dict[str, object] | None = None,
+    session_system_prompt: str | None = None,
     progress_callback=None,
     **_legacy_options: object,
 ) -> dict[str, object]:
     """Answer from live Shuiyuan results using an LLM-driven evidence loop."""
+
+    original_question = question
+    contextual_question = _resolve_context(
+        question=question,
+        conversation_context=conversation_context,
+        session_system_prompt=session_system_prompt,
+        model=llm_model,
+        api_key=llm_api_key,
+        api_base=llm_api_base,
+        timeout_seconds=llm_timeout_seconds,
+    )
+    question = contextual_question.resolved_question
+    previous_entity_set = _coerce_entity_set((conversation_context or {}).get("artifacts"))
 
     _emit_progress(progress_callback, "query_planning", "正在生成桥接搜索计划")
     query_rewrite_backend = "question-only"
@@ -200,6 +218,34 @@ def answer_question(
         structured_evidence = _fallback_structured_evidence()
 
     evidence_items = _evidence_items(ledger_evidence, ranked_results)
+    entity_synthesis = _fallback_entity_synthesis(
+        previous_entity_set=previous_entity_set,
+        contextual_question=contextual_question,
+        candidate_profiles=candidate_profiles,
+        ranked_results=enriched_results,
+    )
+    if contextual_question.is_followup or question_understanding.get("organization_strategy") in {"by_entities", "by_options"}:
+        _emit_progress(progress_callback, "fact_ledger", "正在把帖子线索归并成对象集合")
+        try:
+            entity_synthesis = synthesize_entities_from_evidence(
+                question=question,
+                question_understanding=question_understanding,
+                contextual_question=contextual_question,
+                evidence_items=evidence_items,
+                structured_evidence=structured_evidence,
+                previous_entity_set=previous_entity_set,
+                model=llm_model,
+                api_key=llm_api_key,
+                api_base=llm_api_base,
+                timeout_seconds=llm_timeout_seconds,
+            )
+        except LLMError:
+            entity_synthesis = _fallback_entity_synthesis(
+                previous_entity_set=previous_entity_set,
+                contextual_question=contextual_question,
+                candidate_profiles=candidate_profiles,
+                ranked_results=enriched_results,
+            )
     _emit_progress(progress_callback, "fact_ledger", "正在从候选证据中整理可支持事实")
     try:
         evidence_ledger = build_evidence_ledger(
@@ -228,6 +274,13 @@ def answer_question(
                 evidence_ledger=evidence_ledger,
                 evidence_items=evidence_items,
                 structured_evidence=structured_evidence,
+                entity_set=entity_synthesis.get("entity_set", []),
+                turn_operation=contextual_question.turn_operation,
+                required_attributes=contextual_question.required_attributes,
+                session_answer_instruction=_join_context_instructions(
+                    session_system_prompt,
+                    contextual_question.answer_style_instruction,
+                ),
                 model=llm_model,
                 api_key=llm_api_key,
                 api_base=llm_api_base,
@@ -238,7 +291,40 @@ def answer_question(
     else:
         answer = _generate_extractive_answer(enriched_results)
     return {
-        "question": question,
+        "question": original_question,
+        "resolved_question": question,
+        "is_followup": contextual_question.is_followup,
+        "context_used": {
+            "current_topic": contextual_question.current_topic,
+            "turn_operation": contextual_question.turn_operation,
+            "reuse_strategy": contextual_question.reuse_strategy,
+            "target_entity_type": contextual_question.target_entity_type,
+            "required_attributes": contextual_question.required_attributes,
+            "candidate_filters": contextual_question.candidate_filters,
+            "active_entities": contextual_question.active_entities,
+            "active_constraints": contextual_question.active_constraints,
+            "dropped_context": contextual_question.dropped_context,
+            "retrieval_instruction": contextual_question.retrieval_instruction,
+            "answer_style_instruction": contextual_question.answer_style_instruction,
+        },
+        "session_memory_update": {
+            "current_topic": contextual_question.current_topic or search_plan.intent,
+            "active_entities": _merged_active_entities(
+                contextual_question.active_entities,
+                entity_synthesis.get("entity_set", []),
+            ),
+            "active_constraints": contextual_question.active_constraints,
+            "session_summary": contextual_question.session_summary,
+            "open_questions": contextual_question.open_questions,
+        },
+        "turn_operation": contextual_question.turn_operation,
+        "reuse_strategy": contextual_question.reuse_strategy,
+        "target_entity_type": contextual_question.target_entity_type,
+        "entity_type": entity_synthesis.get("entity_type", ""),
+        "entity_set": entity_synthesis.get("entity_set", []),
+        "entity_merge_notes": entity_synthesis.get("entity_merge_notes", []),
+        "entity_missing_attributes": entity_synthesis.get("missing_attributes", []),
+        "entity_insufficient_entities": entity_synthesis.get("insufficient_entities", []),
         "queries": executed_queries,
         "search_plan": {
             "intent": search_plan.intent,
@@ -285,6 +371,163 @@ def _emit_progress(progress_callback, step: str, message: str) -> None:
     if progress_callback is None:
         return
     progress_callback(step, message)
+
+
+def _resolve_context(
+    *,
+    question: str,
+    conversation_context: dict[str, object] | None,
+    session_system_prompt: str | None,
+    model: str | None,
+    api_key: str | None,
+    api_base: str | None,
+    timeout_seconds: int | None,
+) -> ContextualQuestion:
+    has_context = bool(conversation_context and any(conversation_context.values()))
+    if not has_context and not (session_system_prompt or "").strip():
+        return ContextualQuestion(is_followup=False, resolved_question=question)
+    try:
+        return resolve_contextual_question(
+            question=question,
+            conversation_context=conversation_context,
+            session_system_prompt=session_system_prompt,
+            model=model,
+            api_key=api_key,
+            api_base=api_base,
+            timeout_seconds=timeout_seconds,
+        )
+    except LLMError:
+        return ContextualQuestion(is_followup=False, resolved_question=question)
+
+
+def _join_context_instructions(*items: str | None) -> str:
+    return "；".join(text for text in (" ".join(str(item or "").split()).strip() for item in items) if text)
+
+
+def _coerce_entity_set(artifacts: object) -> list[dict[str, object]]:
+    if not isinstance(artifacts, dict):
+        return []
+    value = artifacts.get("last_entity_set")
+    if not isinstance(value, list):
+        return []
+    entities: list[dict[str, object]] = []
+    for item in value:
+        if isinstance(item, dict) and str(item.get("entity_name", "")).strip():
+            entities.append(item)
+    return entities[:20]
+
+
+def _fallback_entity_synthesis(
+    *,
+    previous_entity_set: list[dict[str, object]],
+    contextual_question: ContextualQuestion,
+    candidate_profiles: list[dict[str, object]],
+    ranked_results: list[CommunitySearchResult],
+) -> dict[str, object]:
+    if previous_entity_set and contextual_question.is_followup and contextual_question.reuse_strategy != "full_refresh":
+        filtered = _filter_previous_entities(previous_entity_set, contextual_question)
+        if filtered:
+            return {
+                "entity_type": contextual_question.target_entity_type if contextual_question.target_entity_type != "unknown" else _entity_type_from_entities(filtered),
+                "entity_set": filtered,
+                "entity_merge_notes": ["沿用上一轮对象集合并按本轮追问过滤。"],
+                "missing_attributes": contextual_question.required_attributes,
+                "insufficient_entities": [],
+            }
+    synthesized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for profile in candidate_profiles:
+        entity_name = " ".join(str(profile.get("primary_object", "")).split()).strip()
+        if not entity_name or entity_name in seen:
+            continue
+        seen.add(entity_name)
+        url = next((result.url for result in ranked_results if result.url == profile.get("url")), str(profile.get("url", "")).strip())
+        synthesized.append(
+            {
+                "entity_id": entity_name,
+                "entity_name": entity_name,
+                "entity_type": _profile_to_entity_type(str(profile.get("object_kind", "")).strip(), contextual_question.target_entity_type),
+                "aliases": [],
+                "attributes": {
+                    "scope": str(profile.get("scope", "")).strip(),
+                    "coverage_tags": profile.get("coverage_tags", []) if isinstance(profile.get("coverage_tags"), list) else [],
+                },
+                "evidence_urls": [url] if url else [],
+                "evidence_ids": [str(profile.get("url", "")).strip()] if str(profile.get("url", "")).strip() else [],
+                "confidence": "medium",
+            }
+        )
+        if len(synthesized) >= 10:
+            break
+    return {
+        "entity_type": _entity_type_from_entities(synthesized) or contextual_question.target_entity_type,
+        "entity_set": synthesized,
+        "entity_merge_notes": [],
+        "missing_attributes": contextual_question.required_attributes,
+        "insufficient_entities": [],
+    }
+
+
+def _filter_previous_entities(
+    entities: list[dict[str, object]],
+    contextual_question: ContextualQuestion,
+) -> list[dict[str, object]]:
+    filters = [term.lower() for term in contextual_question.candidate_filters + contextual_question.active_constraints if term.strip()]
+    if not filters:
+        return entities[:12]
+    filtered: list[dict[str, object]] = []
+    for item in entities:
+        haystack = " ".join(
+            [
+                str(item.get("entity_name", "")),
+                jsonish(item.get("attributes", {})),
+                " ".join(str(alias) for alias in item.get("aliases", []) if alias),
+            ]
+        ).lower()
+        if all(term in haystack for term in filters):
+            filtered.append(item)
+    return filtered[:12] or entities[:12]
+
+
+def _entity_type_from_entities(entities: list[dict[str, object]]) -> str:
+    for item in entities:
+        entity_type = str(item.get("entity_type", "")).strip()
+        if entity_type:
+            return entity_type
+    return "unknown"
+
+
+def _profile_to_entity_type(object_kind: str, fallback: str) -> str:
+    mapping = {
+        "person": "person",
+        "lab": "lab",
+        "course": "course",
+        "place": "location",
+        "department": "department",
+    }
+    return mapping.get(object_kind, fallback or "unknown")
+
+
+def _merged_active_entities(active_entities: list[str], entity_set: object) -> list[str]:
+    merged = list(active_entities)
+    if isinstance(entity_set, list):
+        merged.extend(str(item.get("entity_name", "")).strip() for item in entity_set if isinstance(item, dict))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in merged:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped[:12]
+
+
+def jsonish(value: object) -> str:
+    if isinstance(value, dict):
+        return " ".join(f"{key} {jsonish(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return " ".join(jsonish(item) for item in value)
+    return str(value or "")
 
 
 def _tool_wait_seconds(community_tool: CommunitySearchTool | None) -> int:

@@ -116,6 +116,7 @@ class ShuiyuanDiscourseSearchTool:
         self.total_rate_limit_wait_seconds = 0
         self._max_auto_wait_seconds = 60
         self._max_total_wait_seconds = 180
+        self._max_timeout_retries = 2
         self._progress_callback = progress_callback
 
     def set_progress_callback(self, callback: Callable[[str], None] | None) -> None:
@@ -175,6 +176,7 @@ class ShuiyuanDiscourseSearchTool:
 
     def _open_json(self, request: Request) -> dict[str, object]:
         self.last_rate_limit_wait_seconds = 0
+        timeout_attempt = 0
         try:
             while True:
                 try:
@@ -204,6 +206,17 @@ class ShuiyuanDiscourseSearchTool:
                         retryable=exc.code == 429 and wait_seconds > 0,
                     ) from exc
                 except (URLError, TimeoutError, OSError, ValueError) as exc:
+                    if _is_timeout_error(exc) and timeout_attempt < self._max_timeout_retries:
+                        timeout_attempt += 1
+                        wait_seconds = min(2 * timeout_attempt, 5)
+                        self.last_rate_limit_wait_seconds += wait_seconds
+                        self.total_rate_limit_wait_seconds += wait_seconds
+                        if self._progress_callback is not None:
+                            self._progress_callback(
+                                f"Shuiyuan 请求超时，等待 {wait_seconds} 秒后重试（第 {timeout_attempt} 次）"
+                            )
+                        time.sleep(wait_seconds)
+                        continue
                     raise CommunitySearchError(f"Discourse request failed: {exc}") from exc
         except CommunitySearchError:
             raise
@@ -478,3 +491,13 @@ def _extract_rate_limit_wait_seconds(detail: str) -> int:
         except (TypeError, ValueError):
             return 0
     return 0
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
