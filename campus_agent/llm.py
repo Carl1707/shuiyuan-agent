@@ -31,6 +31,9 @@ class ShuiyuanSearchPlan:
     intent: str
     bridges: list[str]
     queries: list[str]
+    question_understanding: dict[str, object] = field(default_factory=dict)
+    search_views: list[str] = field(default_factory=list)
+    coverage_axes: list[str] = field(default_factory=list)
     answer_contract: dict[str, object] = field(default_factory=dict)
     query_details: list[dict[str, str]] = field(default_factory=list)
     selected_query_details: list[dict[str, str]] = field(default_factory=list)
@@ -48,6 +51,18 @@ class EvidenceAssessment:
     topic_scores: list[dict[str, object]] = field(default_factory=list)
     summary: str = ""
     evidence_roles: list[dict[str, str]] = field(default_factory=list)
+
+
+_DEFAULT_QUESTION_UNDERSTANDING = {
+    "user_goal": "",
+    "result_shape": "single_best",
+    "search_intent": "找最直接可用的校园社区证据",
+    "coverage_expectation": "narrow",
+    "organization_strategy": "flat_summary",
+    "freshness_sensitivity": "medium",
+    "evidence_priority": [],
+    "known_risks": [],
+}
 
 
 def load_local_env() -> None:
@@ -142,12 +157,26 @@ def generate_shuiyuan_search_plan(
             ),
             "请先动态定义什么信息才算真正回答了用户问题，不要套用预设问题类型。",
             (
-                "请输出 JSON 对象，字段固定为 intent、bridges、answer_contract、queries、"
-                f"selected_queries、rejected_queries。queries 最多 {max_queries} 条。"
+                "请输出 JSON 对象，字段固定为 intent、question_understanding、search_views、coverage_axes、"
+                "bridges、answer_contract、queries、selected_queries、rejected_queries。"
+                f"queries 最多 {max_queries} 条。"
+            ),
+            (
+                "question_understanding 包含 user_goal、result_shape、search_intent、coverage_expectation、"
+                "organization_strategy、freshness_sensitivity、evidence_priority、known_risks。"
+                "result_shape 只能是 single_best、actionable_steps、broad_options、current_rule、compare_options。"
+                "coverage_expectation 只能是 narrow、medium、wide。"
+                "organization_strategy 只能是 flat_summary、by_steps、by_entities、by_current_vs_history、by_options。"
+                "freshness_sensitivity 只能是 low、medium、high。"
             ),
             (
                 "answer_contract 包含 user_need、required_facts、helpful_facts、insufficient_evidence、"
                 "requires_latest_evidence、hard_constraints；这些内容必须针对当前问题动态生成。"
+            ),
+            (
+                "如果用户看起来是在问‘有没有、有哪些、哪些、谁在做、哪里可以、求推荐、推荐一下’等宽范围发现问题，"
+                "请优先理解为需要 broad_options，而不是 single_best；"
+                "此时 organization_strategy 优先用 by_entities 或 by_options，coverage_expectation 优先用 wide。"
             ),
             (
                 "如果问题涉及政策、资格条件、申请流程、时间节点、门槛、费用、开放安排、"
@@ -164,6 +193,12 @@ def generate_shuiyuan_search_plan(
             (
                 "queries 中每项包含 query、purpose、lane。lane 只能是 direct、current_cycle、"
                 "community_experience、bridge。purpose 说明该查询准备验证或补充什么。"
+            ),
+            (
+                "对于 broad_options 问题，请先定义 search_views 和 coverage_axes。"
+                "search_views 是这题应该从哪些视角搜索，例如方向、对象、院系、体验、地点、流程。"
+                "coverage_axes 是最终希望覆盖的维度，例如老师、实验室、院系、研究方向、地点、课程类别。"
+                "queries 应分散覆盖这些不同视角，避免全部围绕同一个短词。"
             ),
             "queries 必须模拟水源用户发帖和搜索时的短口语表达，每条通常为 1 至 2 个短词组。",
             "水源接近子串关键词搜索：避免学校全称、长句、正式公文表达和过多关键词堆叠。",
@@ -183,6 +218,9 @@ def generate_shuiyuan_search_plan(
             (
                 '只输出 JSON，例如：'
                 '{"intent":"校园失物与应急求助",'
+                '"question_understanding":{"user_goal":"找到可执行的求助方式","result_shape":"actionable_steps","search_intent":"定位负责部门和可执行动作","coverage_expectation":"medium","organization_strategy":"by_steps","freshness_sensitivity":"medium","evidence_priority":["负责部门","近期案例"],"known_risks":["不要承诺一定能找回"]},'
+                '"search_views":["负责部门","类似案例"],'
+                '"coverage_axes":["部门","动作"],'
                 '"bridges":["保卫处","失物招领","打捞","求助"],'
                 '"answer_contract":{"user_need":"找到可执行的求助方式",'
                 '"required_facts":["可联系的人员或部门","可执行的处理步骤"],'
@@ -226,9 +264,13 @@ def generate_shuiyuan_search_plan(
     raw_selected = parsed.get("selected_queries", [])
     raw_rejected = parsed.get("rejected_queries", [])
     raw_contract = parsed.get("answer_contract", {})
+    raw_understanding = parsed.get("question_understanding", {})
+    raw_search_views = parsed.get("search_views", [])
+    raw_coverage_axes = parsed.get("coverage_axes", [])
     if not isinstance(raw_bridges, list) or not isinstance(raw_queries, list):
         raise LLMError("query planning response must contain list fields")
     bridges = _dedupe_text_items(raw_bridges, limit=8)
+    question_understanding = _normalize_question_understanding(raw_understanding, question)
     answer_contract = _normalize_answer_contract(raw_contract, question)
     query_details = _align_query_years(
         _normalize_query_details(raw_queries, limit=max_queries),
@@ -243,6 +285,9 @@ def generate_shuiyuan_search_plan(
         intent=intent or "校园事务搜索",
         bridges=bridges,
         queries=queries,
+        question_understanding=question_understanding,
+        search_views=_dedupe_text_items(_list_value(raw_search_views), limit=8),
+        coverage_axes=_dedupe_text_items(_list_value(raw_coverage_axes), limit=8),
         answer_contract=answer_contract,
         query_details=query_details,
         selected_query_details=_balance_selected_queries(
@@ -260,10 +305,65 @@ def generate_shuiyuan_search_plan(
     )
 
 
+def classify_candidate_objects(
+    *,
+    question: str,
+    question_understanding: dict[str, object],
+    community_results: list[CommunitySearchResult],
+    model: str | None = None,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    timeout_seconds: int | None = None,
+) -> list[dict[str, object]]:
+    if not community_results:
+        return []
+    config = load_llm_config(
+        model=model,
+        api_key=api_key,
+        api_base=api_base,
+        timeout_seconds=timeout_seconds,
+    )
+    evidence = [
+        {
+            "title": item.title,
+            "url": item.url,
+            "snippet": item.snippet,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "tags": item.tags,
+            "is_wiki": item.is_wiki,
+        }
+        for item in community_results[:30]
+    ]
+    prompt = (
+        f"当前日期：{date.today().isoformat()}。\n"
+        f"用户问题：{question}\n"
+        f"问题理解：{json.dumps(question_understanding, ensure_ascii=False)}\n"
+        f"候选帖子：{json.dumps(evidence, ensure_ascii=False)}\n\n"
+        "请从“当前问题需要找什么对象”的角度，对每条候选做对象归并与作用分析。"
+        "输出 JSON，字段固定为 candidate_profiles。"
+        "candidate_profiles 每项包含 url、primary_object、object_kind、scope、coverage_tags、redundant_with、reason。"
+        "object_kind 只能是 person、lab、team、department、place、course、service、unknown。"
+        "scope 只能是 comprehensive、specialized、single_case、discussion、unknown。"
+        "coverage_tags 是与当前问题相关的对象标签、方向标签或院系标签。"
+        "如果两条帖子明显围绕同一个对象，后者的 redundant_with 应填主对象名；否则留空。"
+        "对于需要 broad_options 的问题，优先把综合帖标成 comprehensive，把单对象帖子标成 specialized 或 single_case。"
+        "不要编造超出标题摘要的信息。严格只输出 JSON。"
+    )
+    parsed = _request_json_object(
+        config,
+        system="你是校园社区候选结果分析器。请按当前问题需要的对象范围，对标题摘要做对象归并和作用判断。严格输出 JSON。",
+        prompt=prompt,
+        temperature=0.1,
+    )
+    return _normalize_candidate_profiles(_list_value(parsed.get("candidate_profiles")), evidence)
+
+
 def assess_shuiyuan_evidence(
     *,
     question: str,
     answer_contract: dict[str, object],
+    question_understanding: dict[str, object] | None,
     community_results: list[CommunitySearchResult],
     model: str | None = None,
     api_key: str | None = None,
@@ -291,6 +391,7 @@ def assess_shuiyuan_evidence(
     prompt = (
         f"当前日期：{date.today().isoformat()}。\n"
         f"用户问题：{question}\n"
+        f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
         f"动态答案契约：{json.dumps(answer_contract, ensure_ascii=False)}\n"
         f"当前 Shuiyuan 搜索证据：{json.dumps(evidence, ensure_ascii=False)}\n\n"
         "先判断这个问题的形状，再判断每条证据在回答当前问题时的角色，而不只是主题相关。"
@@ -352,6 +453,7 @@ def extract_structured_community_evidence(
     question: str,
     question_shape: str,
     answer_contract: dict[str, object],
+    question_understanding: dict[str, object] | None,
     expanded_topics: list[dict[str, object]],
     model: str | None = None,
     api_key: str | None = None,
@@ -379,6 +481,7 @@ def extract_structured_community_evidence(
         f"当前日期：{date.today().isoformat()}。\n"
         f"用户问题：{question}\n"
         f"问题形状：{question_shape}\n"
+        f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
         f"动态答案契约：{json.dumps(answer_contract, ensure_ascii=False)}\n"
         f"已展开帖子正文：{json.dumps(expanded_topics[:8], ensure_ascii=False)}\n\n"
         "请把正文中的可用证据抽成结构化槽位。"
@@ -428,6 +531,7 @@ def build_evidence_ledger(
     question: str,
     question_shape: str,
     answer_contract: dict[str, object],
+    question_understanding: dict[str, object] | None,
     evidence_items: list[dict[str, object]],
     structured_evidence: dict[str, object] | None = None,
     model: str | None = None,
@@ -445,6 +549,7 @@ def build_evidence_ledger(
         f"当前日期：{date.today().isoformat()}。\n"
         f"用户问题：{question}\n"
         f"问题形状：{question_shape}\n"
+        f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
         f"动态答案契约：{json.dumps(answer_contract, ensure_ascii=False)}\n"
         f"结构化正文证据：{json.dumps(structured_evidence or {}, ensure_ascii=False)}\n"
         f"候选证据：{json.dumps(evidence_items[:40], ensure_ascii=False)}\n\n"
@@ -487,6 +592,7 @@ def generate_verified_answer(
     question: str,
     question_shape: str,
     answer_contract: dict[str, object],
+    question_understanding: dict[str, object] | None,
     evidence_ledger: dict[str, object],
     evidence_items: list[dict[str, object]],
     structured_evidence: dict[str, object] | None = None,
@@ -505,6 +611,7 @@ def generate_verified_answer(
         f"当前日期：{date.today().isoformat()}。\n"
         f"用户问题：{question}\n"
         f"问题形状：{question_shape}\n"
+        f"问题理解：{json.dumps(question_understanding or {}, ensure_ascii=False)}\n"
         f"动态答案契约：{json.dumps(answer_contract, ensure_ascii=False)}\n"
         f"结构化正文证据：{json.dumps(structured_evidence or {}, ensure_ascii=False)}\n"
         f"事实账本：{json.dumps(evidence_ledger, ensure_ascii=False)}\n"
@@ -512,6 +619,8 @@ def generate_verified_answer(
         "请生成自然、直接、可执行的中文回答。优先使用 current_answers 和 direct_answers 正面回答用户；"
         "如果问题形状是 enumeration，可把 stable_support 和 useful_support 中能够补全实体信息的内容合并进主体答案，"
         "但当前预约规则、开放时间、人数限制等若无法确认，要单独标出“当前未完全确认”；"
+        "如果问题理解中的 organization_strategy 是 by_entities 或 by_options，优先按对象或选项分条组织；"
+        "不要按帖子顺序拼接内容。"
         "如果问题形状是 time_sensitive_rule，先写“当前能确认的规则/流程”，再写“社区经验补充/准备建议”，"
         "historical_background 只能用于解释“过去有人这样说过，但不能视为现行规则”；"
         "time_sensitive_rule 回答应先用一两句话说明当前状态和共通流程，并明确所有日期与规则对应的证据年份；"
@@ -725,6 +834,22 @@ def _normalize_answer_contract(value: object, question: str) -> dict[str, object
     }
 
 
+def _normalize_question_understanding(value: object, question: str) -> dict[str, object]:
+    raw = value if isinstance(value, dict) else {}
+    understanding = dict(_DEFAULT_QUESTION_UNDERSTANDING)
+    understanding["user_goal"] = " ".join(str(raw.get("user_goal") or question).split()).strip()
+    understanding["result_shape"] = _normalize_result_shape(raw.get("result_shape"))
+    understanding["search_intent"] = " ".join(
+        str(raw.get("search_intent") or _DEFAULT_QUESTION_UNDERSTANDING["search_intent"]).split()
+    ).strip()
+    understanding["coverage_expectation"] = _normalize_coverage_expectation(raw.get("coverage_expectation"))
+    understanding["organization_strategy"] = _normalize_organization_strategy(raw.get("organization_strategy"))
+    understanding["freshness_sensitivity"] = _normalize_freshness_sensitivity(raw.get("freshness_sensitivity"))
+    understanding["evidence_priority"] = _dedupe_text_items(_list_value(raw.get("evidence_priority")), limit=8)
+    understanding["known_risks"] = _dedupe_text_items(_list_value(raw.get("known_risks")), limit=8)
+    return understanding
+
+
 def _normalize_topic_choices(
     items: list[object],
     evidence: list[dict[str, object]],
@@ -751,6 +876,28 @@ def _normalize_question_shape(value: object) -> str:
     shape = str(value or "").strip()
     allowed = {"single_fact", "procedure", "enumeration", "comparison", "recommendation", "time_sensitive_rule"}
     return shape if shape in allowed else "single_fact"
+
+
+def _normalize_result_shape(value: object) -> str:
+    shape = str(value or "").strip()
+    allowed = {"single_best", "actionable_steps", "broad_options", "current_rule", "compare_options"}
+    return shape if shape in allowed else "single_best"
+
+
+def _normalize_coverage_expectation(value: object) -> str:
+    level = str(value or "").strip()
+    return level if level in {"narrow", "medium", "wide"} else "narrow"
+
+
+def _normalize_organization_strategy(value: object) -> str:
+    strategy = str(value or "").strip()
+    allowed = {"flat_summary", "by_steps", "by_entities", "by_current_vs_history", "by_options"}
+    return strategy if strategy in allowed else "flat_summary"
+
+
+def _normalize_freshness_sensitivity(value: object) -> str:
+    level = str(value or "").strip()
+    return level if level in {"low", "medium", "high"} else "medium"
 
 
 def _normalize_topic_scores(
@@ -789,6 +936,46 @@ def _normalize_topic_scores(
         )
     scores.sort(key=lambda item: float(item["expand_score"]), reverse=True)
     return scores
+
+
+def _normalize_candidate_profiles(
+    items: list[object],
+    evidence: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    allowed_urls = {str(item.get("url", "")) for item in evidence}
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = " ".join(str(item.get("url", "")).split()).strip()
+        if not url or url not in allowed_urls or url in seen:
+            continue
+        seen.add(url)
+        normalized.append(
+            {
+                "url": url,
+                "primary_object": " ".join(str(item.get("primary_object", "")).split()).strip(),
+                "object_kind": _normalize_object_kind(item.get("object_kind")),
+                "scope": _normalize_scope(item.get("scope")),
+                "coverage_tags": _dedupe_text_items(_list_value(item.get("coverage_tags")), limit=8),
+                "redundant_with": " ".join(str(item.get("redundant_with", "")).split()).strip(),
+                "reason": " ".join(str(item.get("reason", "")).split()).strip(),
+            }
+        )
+    return normalized
+
+
+def _normalize_object_kind(value: object) -> str:
+    kind = str(value or "").strip()
+    allowed = {"person", "lab", "team", "department", "place", "course", "service", "unknown"}
+    return kind if kind in allowed else "unknown"
+
+
+def _normalize_scope(value: object) -> str:
+    scope = str(value or "").strip()
+    allowed = {"comprehensive", "specialized", "single_case", "discussion", "unknown"}
+    return scope if scope in allowed else "unknown"
 
 
 def _normalize_expected_level(value: object) -> str:

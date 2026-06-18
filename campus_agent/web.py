@@ -343,6 +343,9 @@ def build_answer_response(
         },
         "queries": output["queries"],
         "search_plan": output.get("search_plan", {}),
+        "question_understanding": output.get("question_understanding", {}),
+        "search_views": output.get("search_views", []),
+        "coverage_axes": output.get("coverage_axes", []),
         "question_shape": output.get("question_shape", ""),
         "topic_scores": output.get("topic_scores", []),
         "answer_contract": output.get("answer_contract", {}),
@@ -351,6 +354,7 @@ def build_answer_response(
         "rejected_query_details": output.get("rejected_query_details", []),
         "search_batches": output.get("search_batches", []),
         "coverage_assessments": output.get("coverage_assessments", []),
+        "candidate_profiles": output.get("candidate_profiles", []),
         "expanded_topics": output.get("expanded_topics", []),
         "structured_evidence": output.get("structured_evidence", {}),
         "evidence_ledger": output.get("evidence_ledger", {}),
@@ -1153,6 +1157,18 @@ def _render_homepage(
                     <summary>搜索计划 <span id="plan-intent" class="small">尚未生成 intent。</span></summary>
                     <div class="details-body">
                       <div class="section">
+                        <div class="small">问题理解</div>
+                        <div id="question-understanding" class="citation-list"></div>
+                      </div>
+                      <div class="section">
+                        <div class="small">搜索视角</div>
+                        <div id="search-views" class="pill-row"></div>
+                      </div>
+                      <div class="section">
+                        <div class="small">覆盖维度</div>
+                        <div id="coverage-axes" class="pill-row"></div>
+                      </div>
+                      <div class="section">
                         <div class="small">桥接概念</div>
                         <div id="bridges" class="pill-row"></div>
                       </div>
@@ -1180,6 +1196,12 @@ def _render_homepage(
                     <summary>证据覆盖与补查过程</summary>
                     <div class="details-body">
                       <div id="coverage-assessments" class="citation-list"></div>
+                    </div>
+                  </details>
+                  <details>
+                    <summary>候选对象归并</summary>
+                    <div class="details-body">
+                      <div id="candidate-profiles" class="citation-list"></div>
                     </div>
                   </details>
                   <details>
@@ -1260,12 +1282,16 @@ def _render_homepage(
               progressSteps: Array.from(document.querySelectorAll(".progress-step")),
               answerBox: document.getElementById("answer-box"),
               planIntent: document.getElementById("plan-intent"),
+              questionUnderstanding: document.getElementById("question-understanding"),
+              searchViews: document.getElementById("search-views"),
+              coverageAxes: document.getElementById("coverage-axes"),
               bridges: document.getElementById("bridges"),
               candidateQueries: document.getElementById("candidate-queries"),
               queries: document.getElementById("queries"),
               rejectedQueries: document.getElementById("rejected-queries"),
               answerContract: document.getElementById("answer-contract"),
               coverageAssessments: document.getElementById("coverage-assessments"),
+              candidateProfiles: document.getElementById("candidate-profiles"),
               evidenceLedger: document.getElementById("evidence-ledger"),
               results: document.getElementById("results"),
               communityResults: document.getElementById("community-results"),
@@ -1624,12 +1650,16 @@ def _render_homepage(
                 state.lastAnswer = data.answer || "";
                 elements.answerBox.innerHTML = linkifyAndFormat(data.answer || "未生成回答。");
                 elements.planIntent.textContent = (data.search_plan && data.search_plan.intent) || "未生成 intent。";
+                renderStructured(elements.questionUnderstanding, data.question_understanding || {}, "未生成问题理解。");
+                renderPills(elements.searchViews, data.search_views || []);
+                renderPills(elements.coverageAxes, data.coverage_axes || []);
                 renderPills(elements.bridges, (data.search_plan && data.search_plan.bridges) || []);
                 renderPills(elements.candidateQueries, (data.search_plan && data.search_plan.candidate_queries) || []);
                 renderPills(elements.queries, data.queries || []);
                 renderStructured(elements.rejectedQueries, data.rejected_query_details || [], "没有淘汰 query。");
                 renderStructured(elements.answerContract, data.answer_contract || {}, "未生成动态答案目标。");
                 renderStructured(elements.coverageAssessments, data.coverage_assessments || [], "未执行证据覆盖审计。");
+                renderStructured(elements.candidateProfiles, data.candidate_profiles || [], "没有执行候选对象归并。");
                 renderStructured(elements.evidenceLedger, data.evidence_ledger || {}, "未生成事实账本。");
                 renderCards(elements.results, data.results || [], "没有命中帖子正文片段。", false);
                 renderCards(elements.communityResults, data.community_results || [], "没有找到相关 Shuiyuan 帖子。", true);
@@ -1697,6 +1727,12 @@ def _serialize_community_result(result: CommunitySearchResult) -> dict[str, Any]
         "tags": result.tags,
         "is_wiki": result.is_wiki,
         "support_count": result.support_count,
+        "primary_object": result.primary_object,
+        "object_kind": result.object_kind,
+        "scope": result.scope,
+        "coverage_tags": result.coverage_tags,
+        "redundant_with": result.redundant_with,
+        "ranking_notes": result.ranking_notes,
     }
 
 

@@ -13,6 +13,7 @@ from campus_agent.llm import (
     ShuiyuanSearchPlan,
     assess_shuiyuan_evidence,
     build_evidence_ledger,
+    classify_candidate_objects,
     extract_structured_community_evidence,
     generate_shuiyuan_search_plan,
     generate_verified_answer,
@@ -95,6 +96,7 @@ def answer_question(
         except LLMError:
             search_plan = _fallback_search_plan(question)
             query_rewrite_backend = "question-fallback"
+    question_understanding = search_plan.question_understanding or _fallback_question_understanding(question)
     query_details = search_plan.query_details or [
         {"query": query, "purpose": ""} for query in (search_plan.queries or [question])
     ]
@@ -112,16 +114,31 @@ def answer_question(
     )
     observed_wait_seconds = 0
     observed_wait_seconds = max(observed_wait_seconds, _tool_wait_seconds(community_tool))
+    try:
+        candidate_profiles = classify_candidate_objects(
+            question=question,
+            question_understanding=question_understanding,
+            community_results=community_results,
+            model=llm_model,
+            api_key=llm_api_key,
+            api_base=llm_api_base,
+            timeout_seconds=llm_timeout_seconds,
+        )
+    except LLMError:
+        candidate_profiles = []
     ranked_results = rank_community_results(
         question,
         community_results,
         answer_contract=search_plan.answer_contract,
+        question_understanding=question_understanding,
+        candidate_profiles=candidate_profiles,
     )
     _emit_progress(progress_callback, "evidence_audit", "正在区分直接答案、辅助信息和背景")
     try:
         latest_assessment = assess_shuiyuan_evidence(
             question=question,
             answer_contract=search_plan.answer_contract,
+            question_understanding=question_understanding,
             community_results=ranked_results,
             model=llm_model,
             api_key=llm_api_key,
@@ -156,6 +173,7 @@ def answer_question(
             bridges=search_plan.bridges,
             topics_to_expand=latest_assessment.topics_to_expand,
             question_shape=latest_assessment.question_shape,
+            question_understanding=question_understanding,
         )
         observed_wait_seconds = max(observed_wait_seconds, _tool_wait_seconds(community_tool))
     else:
@@ -171,6 +189,7 @@ def answer_question(
             question=question,
             question_shape=latest_assessment.question_shape,
             answer_contract=search_plan.answer_contract,
+            question_understanding=question_understanding,
             expanded_topics=expanded_topic_docs,
             model=llm_model,
             api_key=llm_api_key,
@@ -187,6 +206,7 @@ def answer_question(
             question=question,
             question_shape=latest_assessment.question_shape,
             answer_contract=search_plan.answer_contract,
+            question_understanding=question_understanding,
             evidence_items=evidence_items,
             structured_evidence=structured_evidence,
             model=llm_model,
@@ -204,6 +224,7 @@ def answer_question(
                 question=question,
                 question_shape=latest_assessment.question_shape,
                 answer_contract=search_plan.answer_contract,
+                question_understanding=question_understanding,
                 evidence_ledger=evidence_ledger,
                 evidence_items=evidence_items,
                 structured_evidence=structured_evidence,
@@ -221,6 +242,9 @@ def answer_question(
         "queries": executed_queries,
         "search_plan": {
             "intent": search_plan.intent,
+            "question_understanding": question_understanding,
+            "search_views": search_plan.search_views,
+            "coverage_axes": search_plan.coverage_axes,
             "bridges": search_plan.bridges,
             "candidate_queries": search_plan.queries,
             "executed_queries": executed_queries,
@@ -232,6 +256,9 @@ def answer_question(
             "topic_scores": latest_assessment.topic_scores,
         },
         "answer_contract": search_plan.answer_contract,
+        "question_understanding": question_understanding,
+        "search_views": search_plan.search_views,
+        "coverage_axes": search_plan.coverage_axes,
         "question_shape": latest_assessment.question_shape,
         "topic_scores": latest_assessment.topic_scores,
         "query_details": query_details,
@@ -239,6 +266,7 @@ def answer_question(
         "rejected_query_details": search_plan.rejected_query_details,
         "search_batches": search_batches,
         "coverage_assessments": coverage_assessments,
+        "candidate_profiles": candidate_profiles,
         "expanded_topics": expanded_topics,
         "structured_evidence": structured_evidence,
         "evidence_ledger": evidence_ledger,
@@ -289,9 +317,49 @@ def _fallback_search_plan(question: str) -> ShuiyuanSearchPlan:
         intent="校园事务搜索",
         bridges=[],
         queries=[question],
+        question_understanding=_fallback_question_understanding(question),
+        search_views=[],
+        coverage_axes=[],
         answer_contract=contract,
         query_details=[{"query": question, "purpose": "直接搜索用户原问题"}],
     )
+
+
+def _fallback_question_understanding(question: str) -> dict[str, object]:
+    normalized = question.strip()
+    broad_markers = ("有没有", "有哪些", "哪些", "哪里可以", "谁在做", "求推荐", "推荐")
+    if any(marker in normalized for marker in broad_markers):
+        return {
+            "user_goal": normalized,
+            "result_shape": "broad_options",
+            "search_intent": "尽可能覆盖不同对象或选项",
+            "coverage_expectation": "wide",
+            "organization_strategy": "by_entities",
+            "freshness_sensitivity": "medium",
+            "evidence_priority": ["综合帖", "不同对象", "可操作经验"],
+            "known_risks": ["同一对象重复帖子霸榜"],
+        }
+    if _requires_latest_evidence(normalized, None):
+        return {
+            "user_goal": normalized,
+            "result_shape": "current_rule",
+            "search_intent": "寻找当前可执行规则或流程",
+            "coverage_expectation": "medium",
+            "organization_strategy": "by_current_vs_history",
+            "freshness_sensitivity": "high",
+            "evidence_priority": ["当前周期证据", "近期经验"],
+            "known_risks": ["容易被旧帖误导"],
+        }
+    return {
+        "user_goal": normalized,
+        "result_shape": "single_best",
+        "search_intent": "找到最直接可用的答案",
+        "coverage_expectation": "narrow",
+        "organization_strategy": "flat_summary",
+        "freshness_sensitivity": "medium",
+        "evidence_priority": ["直接答案"],
+        "known_risks": [],
+    }
 
 
 def _fallback_assessment(answer_contract: dict[str, object]) -> EvidenceAssessment:
@@ -387,6 +455,8 @@ def rank_community_results(
     question: str,
     results: list[CommunitySearchResult],
     answer_contract: dict[str, object] | None = None,
+    question_understanding: dict[str, object] | None = None,
+    candidate_profiles: list[dict[str, object]] | None = None,
 ) -> list[CommunitySearchResult]:
     """Deduplicate and rank Shuiyuan posts using Shuiyuan-native evidence signals."""
 
@@ -399,11 +469,18 @@ def rank_community_results(
         deduped.append(result)
 
     latest_sensitive = _requires_latest_evidence(question, answer_contract)
+    profile_by_url = {str(item.get("url", "")): item for item in (candidate_profiles or [])}
     support_counts = _compute_support_counts(deduped)
     for result in deduped:
         support_count = support_counts.get(result.url, 0)
         result.support_count = support_count
-        result.relevance_score = round(
+        profile = profile_by_url.get(result.url, {})
+        result.primary_object = str(profile.get("primary_object", "") or "")
+        result.object_kind = str(profile.get("object_kind", "") or "")
+        result.scope = str(profile.get("scope", "") or "")
+        result.coverage_tags = list(profile.get("coverage_tags", []) or [])
+        result.redundant_with = str(profile.get("redundant_with", "") or "")
+        base_score = round(
             _text_relevance(question, result.title, result.snippet)
             + _community_layer_bonus(
                 question=question,
@@ -413,6 +490,10 @@ def rank_community_results(
             ),
             6,
         )
+        result.relevance_score = base_score
+        result.ranking_notes = {"base_score": base_score}
+    if _prefers_broad_coverage(question_understanding):
+        return _rank_results_for_coverage(deduped)
     deduped.sort(key=lambda item: item.relevance_score, reverse=True)
     return deduped
 
@@ -435,6 +516,89 @@ def _rank_by_evidence_roles(
     )
 
 
+def _prefers_broad_coverage(question_understanding: dict[str, object] | None) -> bool:
+    if not question_understanding:
+        return False
+    if question_understanding.get("result_shape") == "broad_options":
+        return True
+    return str(question_understanding.get("organization_strategy", "")).strip() in {"by_entities", "by_options"}
+
+
+def _rank_results_for_coverage(results: list[CommunitySearchResult]) -> list[CommunitySearchResult]:
+    remaining = list(results)
+    selected: list[CommunitySearchResult] = []
+    seen_objects: set[str] = set()
+    seen_tags: set[str] = set()
+    while remaining:
+        best: CommunitySearchResult | None = None
+        best_score = float("-inf")
+        best_notes: dict[str, object] = {}
+        for item in remaining:
+            dynamic_score, notes = _coverage_ranking_score(item, seen_objects=seen_objects, seen_tags=seen_tags)
+            if dynamic_score > best_score:
+                best = item
+                best_score = dynamic_score
+                best_notes = notes
+        if best is None:
+            break
+        best.relevance_score = round(best_score, 6)
+        best.ranking_notes = {**(best.ranking_notes or {}), **best_notes}
+        selected.append(best)
+        object_key = _object_key(best)
+        if object_key:
+            seen_objects.add(object_key)
+        seen_tags.update(_normalized_coverage_tags(best))
+        remaining.remove(best)
+    return selected
+
+
+def _coverage_ranking_score(
+    result: CommunitySearchResult,
+    *,
+    seen_objects: set[str],
+    seen_tags: set[str],
+) -> tuple[float, dict[str, object]]:
+    base_score = float(result.ranking_notes.get("base_score", result.relevance_score) if result.ranking_notes else result.relevance_score)
+    object_key = _object_key(result)
+    scope_bonus = _scope_bonus(result.scope)
+    novelty_bonus = 0.18 if object_key and object_key not in seen_objects else 0.0
+    coverage_bonus = min(0.05 * len([tag for tag in _normalized_coverage_tags(result) if tag not in seen_tags]), 0.15)
+    redundancy_penalty = 0.0
+    if result.redundant_with and result.redundant_with.strip().lower() in seen_objects:
+        redundancy_penalty -= 0.22
+    elif object_key and object_key in seen_objects:
+        redundancy_penalty -= 0.18
+    final_score = base_score + scope_bonus + novelty_bonus + coverage_bonus + redundancy_penalty
+    return (
+        final_score,
+        {
+            "base_score": round(base_score, 6),
+            "scope_bonus": round(scope_bonus, 6),
+            "novelty_bonus": round(novelty_bonus, 6),
+            "coverage_bonus": round(coverage_bonus, 6),
+            "redundancy_penalty": round(redundancy_penalty, 6),
+            "final_score": round(final_score, 6),
+        },
+    )
+
+
+def _scope_bonus(scope: str) -> float:
+    return {
+        "comprehensive": 0.12,
+        "specialized": 0.04,
+        "single_case": -0.04,
+        "discussion": -0.08,
+    }.get(scope, 0.0)
+
+
+def _object_key(result: CommunitySearchResult) -> str:
+    return result.primary_object.strip().lower()
+
+
+def _normalized_coverage_tags(result: CommunitySearchResult) -> list[str]:
+    return [str(tag).strip().lower() for tag in (result.coverage_tags or []) if str(tag).strip()]
+
+
 def _retrieve_community_evidence(
     *,
     question: str,
@@ -445,12 +609,18 @@ def _retrieve_community_evidence(
     bridges: list[str],
     topics_to_expand: list[dict[str, str]],
     question_shape: str,
+    question_understanding: dict[str, object] | None,
 ) -> tuple[list[RetrievalResult], list[RetrievalResult], list[CommunitySearchResult], list[dict[str, str]], list[dict[str, object]]]:
     if community_tool is None or not ranked_results:
         evidence = _search_result_evidence(ranked_results, question, top_k=max(top_k, 5))
         return evidence, evidence, ranked_results[:top_k], [], []
 
-    fetch_candidates = _select_body_fetch_candidates(ranked_results, topics_to_expand, question_shape=question_shape)
+    fetch_candidates = _select_body_fetch_candidates(
+        ranked_results,
+        topics_to_expand,
+        question_shape=question_shape,
+        question_understanding=question_understanding,
+    )
     if not fetch_candidates:
         evidence = _search_result_evidence(ranked_results, question, top_k=max(top_k, 5))
         return evidence, evidence, ranked_results[:top_k], [], []
@@ -579,6 +749,7 @@ def _select_body_fetch_candidates(
     topics_to_expand: list[dict[str, str]],
     *,
     question_shape: str,
+    question_understanding: dict[str, object] | None,
 ) -> list[CommunitySearchResult]:
     by_url = {result.url: result for result in ranked_results}
     selected = [
@@ -587,7 +758,11 @@ def _select_body_fetch_candidates(
         if item.get("url") in by_url
     ]
     if selected:
-        return _diversify_fetch_candidates(selected, budget=_expansion_budget(question_shape))
+        return _diversify_fetch_candidates(
+            selected,
+            budget=_expansion_budget(question_shape),
+            prefer_object_diversity=_prefers_broad_coverage(question_understanding),
+        )
     return [
         result
         for result in ranked_results
@@ -768,6 +943,9 @@ def _search_result_evidence(
                 "solution_post_number": item.solution_post_number,
                 "topic_tags": item.tags,
                 "support_count": item.support_count,
+                "primary_object": item.primary_object,
+                "object_kind": item.object_kind,
+                "scope": item.scope,
             },
         )
         evidence.append(
@@ -883,15 +1061,22 @@ def _diversify_fetch_candidates(
     candidates: list[CommunitySearchResult],
     *,
     budget: int,
+    prefer_object_diversity: bool = False,
 ) -> list[CommunitySearchResult]:
     selected: list[CommunitySearchResult] = []
     seen_signatures: list[set[str]] = []
+    seen_objects: set[str] = set()
     for item in candidates:
+        object_key = _object_key(item)
+        if prefer_object_diversity and object_key and object_key in seen_objects:
+            continue
         signature = _support_terms(item.title, item.snippet)
         if any(_signature_overlap(signature, existing) >= 0.7 for existing in seen_signatures):
             continue
         selected.append(item)
         seen_signatures.append(signature)
+        if object_key:
+            seen_objects.add(object_key)
         if len(selected) >= budget:
             break
     if len(selected) < budget:
@@ -943,6 +1128,9 @@ def _evidence_items(
                 "text": hit.chunk.text,
                 "topic_is_wiki": bool(hit.chunk.metadata.get("topic_is_wiki")),
                 "is_solution": bool(hit.chunk.metadata.get("is_solution")),
+                "primary_object": hit.chunk.metadata.get("primary_object", ""),
+                "object_kind": hit.chunk.metadata.get("object_kind", ""),
+                "scope": hit.chunk.metadata.get("scope", ""),
             }
         )
     for index, result in enumerate(ranked_results[:20], start=1):
@@ -960,6 +1148,9 @@ def _evidence_items(
                 "topic_is_wiki": result.is_wiki,
                 "has_solution": result.has_solution,
                 "support_count": result.support_count,
+                "primary_object": result.primary_object,
+                "object_kind": result.object_kind,
+                "scope": result.scope,
             }
         )
     return items[:_LEDGER_CANDIDATE_LIMIT]

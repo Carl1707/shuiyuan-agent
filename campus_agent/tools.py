@@ -27,10 +27,20 @@ class CommunitySearchResult:
     has_solution: bool = False
     solution_post_number: int = 0
     support_count: int = 0
+    primary_object: str = ""
+    object_kind: str = ""
+    scope: str = ""
+    coverage_tags: list[str] | None = None
+    redundant_with: str = ""
+    ranking_notes: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.tags is None:
             self.tags = []
+        if self.coverage_tags is None:
+            self.coverage_tags = []
+        if self.ranking_notes is None:
+            self.ranking_notes = {}
 
 
 @dataclass(slots=True)
